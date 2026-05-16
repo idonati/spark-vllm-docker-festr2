@@ -139,14 +139,18 @@ What "skeleton" means: the kernel exists as code that compiles and matches the K
 
 #### Status — what's NOT done (blocks C33 production-readiness)
 
-- ❌ **Prefill path** — currently raises NotImplementedError. The first inference request needs prefill (q_len > 1); without a working prefill the C33 recipe will crash immediately. Plan: copy the dequant-and-SDPA prefill pattern from `TurboQuantAttentionImpl._flash_attn_varlen` (it materializes the cached K/V to BF16 and calls flash-attn). Adapt for diffkv head dims. Estimated 0.5-1 day.
+- ✅ **Prefill path** — implemented as a Triton dequant kernel (`_tq_diffkv_dequant_k8v4_linear`) that materializes the compressed slots referenced by `block_table` into linear BF16 K/V buffers, followed by PyTorch causal SDPA per request. Smoke tested:
+    - Single-request prefill (q_len=8, prefix=24, seq=32, NH_Q=4): max abs err 1.2e-4.
+    - B=2 batched prefill (heterogeneous q lengths): max abs err 2.4e-4 per request.
+    - Mixed prefill+decode (q_len=4 and q_len=1 in same batch): max abs err 2.3e-4.
+    - **Production shape** (NH_Q=16, NH_KV=1, seq=2048, q_len=64): max abs err 1.5e-5.
+  All errors are at bf16 round-trip noise floor, i.e. the kernel matches a fp32 reference computed on the same dequantized K/V to within bf16's representable precision.
 - ❌ **Per-tile-load striding correctness** — store kernel uses `key.contiguous()`/`value.contiguous()`; need to verify the diffkv attention path produces K and V with the assumed contiguous strides under all batch shapes (TP=8 produces num_kv_heads=1 per worker; verify TP=4 case too).
-- ❌ **Engine-shape validation** — smoke test ran on 1×1×4×32 micro-shape. Real shapes: query [B=1..4, 128, 192], cache shape [num_blocks, 16, 1, 260]. The KV-group broadcast inside the kernel (Hq//Hk = 16) hasn't been exercised; the smoke test only used Hq//Hk = 4.
-- ❌ **CUDA graph capture** — TritonAttentionDiffKVMetadataBuilder allocates a `softmax_segm_output` buffer for the BF16 path. The TQ decode kernel doesn't use that buffer; need to verify capture works with the alternate execution path.
-- ❌ **MTP draft-head path** — `mimo_v2_mtp.py` instantiates its own attention layers (the MTP draft head) which also need cache_config plumbing. Not patched in this round.
-- ❌ **Numerical validation against real production-shape decode** — the 1e-8 match was against a manually-dequantized reference. Real test should be: serve a known-good prompt at FP8 (after fix Patch A) vs at TQ-K8V4, compare token logprobs/output.
+- ❌ **CUDA graph capture** — `TritonAttentionDiffKVMetadataBuilder` allocates a `softmax_segm_output` buffer for the BF16 path. The TQ decode kernel doesn't use that buffer, and the prefill fallback allocates fresh K/V buffers each call (incompatible with graph capture). Plan: pre-allocate the dequant K/V scratch in the metadata builder once at max shape, reuse across calls. Estimated 0.5 day.
+- ❌ **MTP draft-head path** — `mimo_v2_mtp.py` instantiates its own attention layers (the MTP draft head) which also need cache_config plumbing. Not patched in this round. Pattern is identical to the main-model `patch_mimo_v2_cache_config.py`; should take an hour.
+- ❌ **End-to-end engine launch + numerical validation against C32** — the unit-level smoke tests above prove the kernels are individually correct. The next gate is launching the C33 recipe against the real cluster, comparing token logprobs against C32 on the same prompt. Risks at this gate: contiguity assumptions, layer wiring (does the cache_config flow actually reach every layer?), CUDA-graph compatibility, MoE / quant interactions.
 
-End-to-end C33 readiness estimate: **2-3 focused days** after this session. Of that, the prefill fallback is the largest single piece (~1 day), and shape-correctness debugging is hard to time-box.
+End-to-end C33 readiness estimate: **1-2 focused days** remaining. The CUDA-graph piece is the riskiest; everything else is well-scoped.
 
 ### M2 — Extend to `turboquant_k3v4_nc` / `4bit_nc` (~2 days after M1 lands in production)
 

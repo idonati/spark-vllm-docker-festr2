@@ -297,23 +297,235 @@ def triton_turboquant_diffkv_decode(
     )
 
 
-def _dequant_prefill_fallback(
-    query, kv_cache, output, cu_seqlens_q, seqused_k, block_table,
-    softmax_scale, head_size_q, head_size_v, tq_config_k,
+@triton.jit
+def _tq_diffkv_dequant_k8v4_linear(
+    # Compressed cache + index tensors.
+    KV_cache_ptr,          # uint8 view of [num_blocks, block_size, NH_KV, slot]
+    Block_table_ptr,       # int32 [B, max_blocks]
+    Seq_lens_ptr,          # int32 [B]
+    # Linear output buffers (one entry per (request, pos, kv_head)).
+    K_out_ptr,             # bf16 [B, MAX_SEQ, NH_KV, HEAD_DIM_K]
+    V_out_ptr,             # bf16 [B, MAX_SEQ, NH_KV, HEAD_DIM_V]
+    # Strides
+    stride_cache_block: tl.constexpr,
+    stride_cache_pos: tl.constexpr,
+    stride_cache_head: tl.constexpr,
+    stride_bt_b,
+    stride_kob,
+    stride_kos,
+    stride_koh,
+    stride_vob,
+    stride_vos,
+    stride_voh,
+    # Layout constants
+    NH_KV: tl.constexpr,
+    HEAD_DIM_K: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    KPS: tl.constexpr,          # = HEAD_DIM_K (FP8 keys)
+    VAL_DATA_BYTES: tl.constexpr,
+    BLOCK_DK: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    FP8_E4B15: tl.constexpr = 0,
 ):
-    """SLOW prefill fallback: not optimized; just numerically correct.
+    """Walk the compressed cache slots for a request and write BF16 K/V.
 
-    Materializes the full K/V tensors at BF16 from the packed cache,
-    then calls ``torch.nn.functional.scaled_dot_product_attention``.
-
-    M1 doesn't target prefill perf; long-context *decode* is the bottleneck
-    the user actually cares about (one request, growing context). Prefill
-    is one-shot at request start.  This path is structurally correct so
-    end-to-end output is sound; future work can specialize this if
-    prefill cost ever matters.
+    One program per (batch, kv_head, position). For positions past the
+    request's seq_len, do nothing.
     """
-    raise NotImplementedError(
-        "Prefill dequant fallback for diffkv K8V4 not yet implemented; "
-        "M1 smoke tests should use --max-num-seqs 1 --max-num-batched-tokens 1 "
-        "or guarantee q_len==1 in the impl router.  TODO: implement before C33."
+    bid = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    pos = tl.program_id(2)
+
+    seq_len = tl.load(Seq_lens_ptr + bid)
+    if pos >= seq_len:
+        return
+
+    page_idx = pos // BLOCK_SIZE
+    page_off = pos % BLOCK_SIZE
+    block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx).to(tl.int64)
+
+    slot_base = (
+        block_num * stride_cache_block
+        + page_off.to(tl.int64) * stride_cache_pos
+        + tl.cast(kv_head, tl.int64) * stride_cache_head
     )
+
+    # ── K dequant ────────────────────────────────────────────────────
+    dk_offs = tl.arange(0, BLOCK_DK)
+    dk_mask = dk_offs < HEAD_DIM_K
+    k_raw = tl.load(KV_cache_ptr + slot_base + dk_offs, mask=dk_mask, other=0)
+    if FP8_E4B15:
+        k_fp8 = k_raw.to(tl.float8e4b15, bitcast=True)
+    else:
+        k_fp8 = k_raw.to(tl.float8e4nv, bitcast=True)
+    k_bf = k_fp8.to(tl.bfloat16)
+
+    k_out_base = (
+        bid * stride_kob + pos * stride_kos + kv_head * stride_koh
+    )
+    tl.store(K_out_ptr + k_out_base + dk_offs, k_bf, mask=dk_mask)
+
+    # ── V dequant ────────────────────────────────────────────────────
+    dv_offs = tl.arange(0, BLOCK_DV)
+    dv_mask = dv_offs < HEAD_DIM_V
+    v_bit_off = dv_offs * 4
+    v_byte_idx = v_bit_off // 8
+    v_bit_shift = v_bit_off % 8
+    v_bytes = tl.load(
+        KV_cache_ptr + slot_base + KPS + v_byte_idx,
+        mask=dv_mask, other=0,
+    )
+    v_idx = (v_bytes >> v_bit_shift) & 0xF
+
+    # Per-vector scale (fp16) and zero (fp16): 4 bytes after VAL_DATA_BYTES
+    sc_base = slot_base + KPS + VAL_DATA_BYTES
+    sc_lo = tl.load(KV_cache_ptr + sc_base)
+    sc_hi = tl.load(KV_cache_ptr + sc_base + 1)
+    zr_lo = tl.load(KV_cache_ptr + sc_base + 2)
+    zr_hi = tl.load(KV_cache_ptr + sc_base + 3)
+    sc_u16 = sc_lo.to(tl.uint16) | (sc_hi.to(tl.uint16) << 8)
+    zr_u16 = zr_lo.to(tl.uint16) | (zr_hi.to(tl.uint16) << 8)
+    v_scale = sc_u16.to(tl.float16, bitcast=True).to(tl.float32)
+    v_zero = zr_u16.to(tl.float16, bitcast=True).to(tl.float32)
+    v_dequant = (v_idx.to(tl.float32) * v_scale + v_zero).to(tl.bfloat16)
+
+    v_out_base = (
+        bid * stride_vob + pos * stride_vos + kv_head * stride_voh
+    )
+    tl.store(V_out_ptr + v_out_base + dv_offs, v_dequant, mask=dv_mask)
+
+
+def _dequant_prefill_fallback(
+    query: torch.Tensor,         # [total_q, NH_Q, head_size_q]  bf16/fp16
+    kv_cache: torch.Tensor,      # [num_blocks, block_size, NH_KV, slot]
+    output: torch.Tensor,        # [total_q, NH_Q, head_size_v]  bf16/fp16
+    cu_seqlens_q: torch.Tensor,  # [B+1]
+    seqused_k: torch.Tensor,     # [B]
+    block_table: torch.Tensor,   # [B, max_num_blocks]
+    softmax_scale: float,
+    head_size_q: int,
+    head_size_v: int,
+    tq_config_k,
+):
+    """Correct-but-slow prefill / multi-q-token fallback.
+
+    Strategy:
+    1. Bulk-dequant the compressed cache slots referenced by
+       ``block_table`` into linear BF16 K/V tensors (one Triton kernel).
+    2. For each request, run causal attention via PyTorch ops (einsum +
+       softmax) with the linear K/V.
+
+    Memory: ``B * max_seq * NH_KV * (Hq + Hv) * 2`` bytes per layer per
+    call. For B=4, max_seq=32k, NH_KV=1, Hq+Hv=320 → 80 MiB. Allocated
+    and freed per layer; PyTorch's caching allocator should handle this
+    cheaply.
+
+    Numerically: produces the same result as running ``unified_attention_diffkv``
+    on a BF16-materialized cache. M3 will validate this end-to-end.
+    """
+    import torch.nn.functional as F
+
+    if tq_config_k.value_quant_bits != 4 or not tq_config_k.key_fp8:
+        raise NotImplementedError(
+            "Only K8V4 prefill fallback implemented; got "
+            f"K_fp8={tq_config_k.key_fp8} V_bits={tq_config_k.value_quant_bits}"
+        )
+
+    total_q, NH_Q, _ = query.shape
+    num_blocks, block_size, NH_KV, slot_size = kv_cache.shape
+    B = seqused_k.numel()
+    max_seq = int(seqused_k.max().item())
+    kv_group = NH_Q // NH_KV
+    val_data_bytes = math.ceil(head_size_v * 4 / 8)
+    kps = head_size_q
+
+    cache_view = kv_cache.view(torch.uint8)
+    assert cache_view.is_contiguous()
+    stride_cache_block = block_size * NH_KV * slot_size
+    stride_cache_pos = NH_KV * slot_size
+    stride_cache_head = slot_size
+
+    K_lin = torch.empty(
+        (B, max_seq, NH_KV, head_size_q),
+        dtype=query.dtype, device=query.device,
+    )
+    V_lin = torch.empty(
+        (B, max_seq, NH_KV, head_size_v),
+        dtype=query.dtype, device=query.device,
+    )
+
+    BLOCK_DK = 1 << (head_size_q - 1).bit_length()
+    BLOCK_DV = 1 << (head_size_v - 1).bit_length()
+
+    grid = (B, NH_KV, max_seq)
+    _tq_diffkv_dequant_k8v4_linear[grid](
+        cache_view,
+        block_table,
+        seqused_k,
+        K_lin,
+        V_lin,
+        stride_cache_block,
+        stride_cache_pos,
+        stride_cache_head,
+        block_table.stride(0),
+        K_lin.stride(0),
+        K_lin.stride(1),
+        K_lin.stride(2),
+        V_lin.stride(0),
+        V_lin.stride(1),
+        V_lin.stride(2),
+        NH_KV=NH_KV,
+        HEAD_DIM_K=head_size_q,
+        HEAD_DIM_V=head_size_v,
+        BLOCK_SIZE=block_size,
+        KPS=kps,
+        VAL_DATA_BYTES=val_data_bytes,
+        BLOCK_DK=BLOCK_DK,
+        BLOCK_DV=BLOCK_DV,
+        FP8_E4B15=_use_fp8_e4b15(),
+    )
+
+    # Per-request causal attention. The varlen / B>1 case is handled
+    # with a Python loop; for B=1 (single-user serve) this is a single
+    # iteration.  TODO(M2 or later): replace with a single batched call
+    # if profiler shows this is hot.
+    cu = cu_seqlens_q.tolist()
+    for b in range(B):
+        q_start = cu[b]
+        q_end = cu[b + 1]
+        q_len = q_end - q_start
+        s_len = int(seqused_k[b].item())
+        prefix_len = s_len - q_len
+
+        if q_len == 0:
+            continue
+
+        q_chunk = query[q_start:q_end]            # [q_len, NH_Q, Hq]
+        k_full = K_lin[b, :s_len]                  # [s_len, NH_KV, Hq]
+        v_full = V_lin[b, :s_len]                  # [s_len, NH_KV, Hv]
+
+        # GQA expansion: NH_KV → NH_Q via repeat_interleave on the head dim.
+        if kv_group > 1:
+            k_full = k_full.repeat_interleave(kv_group, dim=1)
+            v_full = v_full.repeat_interleave(kv_group, dim=1)
+        # Now shapes: k_full [s_len, NH_Q, Hq], v_full [s_len, NH_Q, Hv]
+
+        # Permute for batched matmul: [NH_Q, q_len, Hq] x [NH_Q, Hq, s_len]
+        q_perm = q_chunk.permute(1, 0, 2).float()
+        k_perm = k_full.permute(1, 0, 2).float()
+        v_perm = v_full.permute(1, 0, 2).float()
+
+        scores = torch.einsum("hqd,hsd->hqs", q_perm, k_perm) * softmax_scale
+
+        # Causal mask: q token i (within chunk) attends to positions
+        # [0, prefix_len + i + 1).  Build an [q_len, s_len] bool mask.
+        q_pos = torch.arange(prefix_len, prefix_len + q_len, device=q_chunk.device)
+        kv_pos = torch.arange(s_len, device=q_chunk.device)
+        mask = kv_pos[None, :] <= q_pos[:, None]   # [q_len, s_len]
+        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
+
+        weights = F.softmax(scores, dim=-1)
+        out_chunk = torch.einsum("hqs,hsd->hqd", weights, v_perm)  # [NH_Q, q_len, Hv]
+        out_chunk = out_chunk.permute(1, 0, 2).to(output.dtype)
+        output[q_start:q_end] = out_chunk

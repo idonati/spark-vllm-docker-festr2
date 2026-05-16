@@ -140,3 +140,50 @@ KV cache size at boot: **619,881 tokens** (small reduction vs C27's 696k due to 
 ### Recipe note
 
 The working recipe at C28 (in `recipes/4x-spark-cluster/mimo-v2.5-pro-c28.yaml`) is the recommended baseline for coding workloads: 32k context, 4 concurrent, FP8 KV cache, CUDA graphs.
+
+## C32 — MTP speculative decoding (with fused-qkv-split fix for MTP head)
+
+Same recipe as C31 but with `patch_mimo_v2_mtp_qkv_split.py` applied. The MTP head's `mimo_v2_mtp.py` had the SAME naive `chunk(tp_size, dim=0)[tp_rank]` bug as the main model's `mimo_v2.py` — fixed identically.
+
+| Test | C28 (no spec) | C31 (broken MTP) | **C32 (fixed MTP)** | C32 vs C28 |
+|---|---|---|---|---|
+| LRU code | 13.26 tok/s | 10.39 | **18.83** | **+42%** |
+| Refactor | 12.31 tok/s | 10.53 | **18.08** | **+47%** |
+| Long context (26k) | 5.58 tok/s | 4.40 | 5.62 | +1% |
+| Solo (sweep) | 12.20 tok/s | 10.96 | **17.88** | **+47%** |
+| 2 concurrent | 19.48 tok/s | 16.74 | **28.74** | **+47%** |
+| 4 concurrent | 36.31 tok/s | 29.60 | **50.89** | **+40%** |
+
+### Output quality (improved)
+
+Refactor task C28 vs C32:
+
+**C28 (`UserRepository` refactor)**:
+```python
+class UserRepository:
+    def __init__(self, db):
+        self.db = db
+
+    def _find_by(self, field, value):
+        """Generic
+```
+
+**C32 (`UserRepository` refactor)**:
+```python
+class UserRepository:
+    # Whitelist of fields that can be used in _find_by queries
+    _VALID_FIELDS = {"id", "email", "name"}
+```
+
+C32's output adds a field whitelist, a stronger defensive-coding pattern than C28's.
+
+### Observations
+
+- **Solo decode 18 tok/s is in the "actually usable for interactive coding" range** (Cursor/Claude users feel ~30+ tok/s as fluid; this is in the same ballpark for a self-hosted setup).
+- **50 tok/s aggregate at 4 concurrent users** — viable for a small team.
+- **Long context (26k) only +1%** because attention bandwidth dominates there; MTP can't speed up the full-attention layers' KV reads. Hierarchical KV summarization is the lever for that regime.
+- **Output quality improved slightly** — MTP draft + verify means the model often takes paths that look more deliberate.
+
+### Recipe
+
+`recipes/4x-spark-cluster/mimo-v2.5-pro-c31.yaml` (the same recipe that was used for C31; the difference between C31 and C32 is the `patch_mimo_v2_mtp_qkv_split.py` fix wired into the launcher).

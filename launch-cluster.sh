@@ -926,6 +926,31 @@ start_cluster() {
     fi
 
 
+    # MIMO-mimo-v2-mtp-qkv-split-patch
+    # Same fused-qkv-split bug exists in vLLM's mimo_v2_mtp.py (MTP draft
+    # head loader). Without this, MTP attention runs with Q values in K/V
+    # slots on tp_size-1 of tp_size ranks, draft tokens are near-random,
+    # and acceptance hovers at 3-24% instead of the 70%+ a healthy MTP
+    # head should achieve.
+    patch_mimo_v2_mtp_qkv_split_in_container() {
+        local target="$1"; local container="$2"; local is_local="$3"
+        local script_path="$HOME/spark-vllm-docker-main/patch_mimo_v2_mtp_qkv_split.py"
+        if [[ "$is_local" == "true" ]]; then
+            docker cp "$script_path" "$container":/tmp/patch_mimo_v2_mtp_qkv_split.py
+            docker exec "$container" python3 /tmp/patch_mimo_v2_mtp_qkv_split.py
+        else
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$target" "docker exec -i $container tee /tmp/patch_mimo_v2_mtp_qkv_split.py >/dev/null && docker exec $container python3 /tmp/patch_mimo_v2_mtp_qkv_split.py" < "$script_path"
+        fi
+    }
+    if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+        echo "Patching MiMo-V2-MTP fused qkv_proj loader Q/K/V split (MTP head fix)..."
+        patch_mimo_v2_mtp_qkv_split_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
+        for worker in "${PEER_NODES[@]}"; do
+            patch_mimo_v2_mtp_qkv_split_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
+        done
+    fi
+
+
     # Patch CUTLASS_MLA + FLASHMLA + FLASH_ATTN_MLA to accept sm_12x (GB10).
     # Default supports_compute_capability checks major == 10 (CUTLASS_MLA) or
     # major == 9 / [9,10] (FLASH_ATTN_MLA / FLASHMLA). GB10 is sm_121 (major 12).

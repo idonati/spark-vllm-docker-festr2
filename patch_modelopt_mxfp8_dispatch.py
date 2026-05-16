@@ -19,7 +19,7 @@ just aren't wired into the mixed-precision dispatch. This patch:
   2. Adds an "MXFP8" branch to get_quant_method for both LinearBase and
      FusedMoE, mirroring the existing FP8 and NVFP4 branches.
 
-Author: Soares Mission Control (Cycle 15), 2026-05-13.
+Author: 2026-05-13.
 """
 import re
 import sys
@@ -43,7 +43,7 @@ if path is None:
     print("SKIP-not-found")
     sys.exit(0)
 
-MARKER = "# SOARES-C15: wire MXFP8 into modelopt_mixed dispatch"
+MARKER = "# MIMO-MXFP8-DISPATCH"
 if MARKER in content:
     print("NOOP-already-patched")
     sys.exit(0)
@@ -70,14 +70,14 @@ new_init = '''    def __init__(
         quantized_layers: dict[str, dict[str, Any]],
         fp8_config: ModelOptFp8Config,
         nvfp4_config: ModelOptNvFp4Config,
-        mxfp8_config: "ModelOptMxFp8Config | None" = None,  # SOARES-C15
+        mxfp8_config: "ModelOptMxFp8Config | None" = None,  # MIMO-MXFP8-DISPATCH
     ) -> None:
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
-        self.mxfp8_config = mxfp8_config  # SOARES-C15'''
+        self.mxfp8_config = mxfp8_config  # MIMO-MXFP8-DISPATCH'''
 
 if old_init not in content:
     print("FAIL-init-no-match")
@@ -118,7 +118,7 @@ new_build = '''        fp8_config = ModelOptFp8Config(
             exclude_modules=[],
             group_size=group_size,
         )
-        # SOARES-C15: wire MXFP8 into modelopt_mixed dispatch
+        # MIMO-MXFP8-DISPATCH
         # Need to build a ModelOptMxFp8Config so MXFP8-tagged layers
         # (e.g. attention QKV/O in festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8)
         # get the proper ModelOptMxFp8LinearMethod instead of silently
@@ -164,7 +164,7 @@ new_linear_dispatch = '''        if isinstance(layer, LinearBase):
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
-            # SOARES-C15: handle MXFP8-quantized attention layers
+            # MIMO-MXFP8-DISPATCH: handle MXFP8-quantized attention layers
             if quant_algo == "MXFP8" and self.mxfp8_config is not None:
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
             # Layer not in quantized_layers — leave unquantized
@@ -200,7 +200,7 @@ new_moe_dispatch = '''        if isinstance(layer, FusedMoE):
                     quant_config=self.nvfp4_config,
                     moe_config=layer.moe_config,
                 )
-            # SOARES-C15: also handle MXFP8 MoE (defensive — festr2's
+            # MIMO-MXFP8-DISPATCH: also handle MXFP8 MoE (defensive — festr2's
             # MiMo only uses MXFP8 for attention, not MoE, but mirror
             # the linear dispatch for completeness).
             if quant_algo == "MXFP8" and self.mxfp8_config is not None:

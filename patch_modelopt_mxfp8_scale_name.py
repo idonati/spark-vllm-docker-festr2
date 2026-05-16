@@ -15,7 +15,7 @@ Also: emit a one-shot diagnostic per rank printing the loaded scale's range
 and a few sample bytes, so we can verify the load worked without re-running
 with extra logging glue.
 
-Author: Soares Mission Control (Cycle 20), 2026-05-15.
+Author: 2026-05-15.
 """
 import sys
 
@@ -38,7 +38,7 @@ if path is None:
     print("SKIP-not-found")
     sys.exit(0)
 
-MARKER = "# SOARES-C20: rename weight_scale -> weight_scale_inv (no flip)"
+MARKER = "# MIMO-MXFP8-SCALE-RENAME"
 if MARKER in content:
     print("NOOP-already-patched")
     sys.exit(0)
@@ -90,11 +90,11 @@ new_proc = '''    def process_weights_after_loading(self, layer: torch.nn.Module
                 "weight_scale",
                 _nn.Parameter(_ws, requires_grad=False),
             )
-            if not globals().get("_SOARES_C20_DIAG", False):
+            if not globals().get("_MIMO_MXFP8_SCALE_DIAG", False):
                 _rank = _os.environ.get("RANK", _os.environ.get("LOCAL_RANK", "?"))
                 _sample = _ws.flatten()[:8].tolist()
                 print(
-                    f"[SOARES-C20-DIAG rank={_rank}] "
+                    f"[MXFP8-SCALE-DIAG rank={_rank}] "
                     f"weight.shape={tuple(layer.weight.shape)} "
                     f"weight.dtype={layer.weight.dtype} "
                     f"scale.shape={tuple(_ws.shape)} "
@@ -104,7 +104,7 @@ new_proc = '''    def process_weights_after_loading(self, layer: torch.nn.Module
                     f"scale.max={_ws.max().item()}",
                     flush=True,
                 )
-                globals()["_SOARES_C20_DIAG"] = True
+                globals()["_MIMO_MXFP8_SCALE_DIAG"] = True
 
         # Validate weight tensor
         if layer.weight.ndim != 2:

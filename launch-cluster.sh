@@ -826,7 +826,7 @@ start_cluster() {
     fi
 
 
-    # SOARES-C12-marlin-chunked-repack-patch
+    # MIMO-marlin-chunked-repack-patch
     # Patch vLLM Marlin NVFP4 MoE weight repack to stream into a preallocated
     # output tensor instead of accumulating 48 expert tensors + torch.cat.
     # Drops peak memory by ~36 GiB so head node (extra Ray/API/EngineCore
@@ -843,7 +843,7 @@ start_cluster() {
         fi
     }
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
-        echo "Patching vLLM Marlin NVFP4 MoE chunked repack (head-OOM fix, Soares C12)..."
+        echo "Patching vLLM Marlin NVFP4 MoE chunked repack (head-OOM fix)..."
         patch_marlin_chunked_repack_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
         for worker in "${PEER_NODES[@]}"; do
             patch_marlin_chunked_repack_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
@@ -851,7 +851,7 @@ start_cluster() {
     fi
 
 
-    # SOARES-C15-modelopt-mxfp8-dispatch-patch
+    # MIMO-modelopt-mxfp8-dispatch-patch
     # Wire MXFP8 into ModelOptMixedPrecisionConfig.get_quant_method dispatch.
     # festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8 tags attention layers as
     # quant_algo: "MXFP8" but vLLM's modelopt_mixed code only branches on
@@ -868,7 +868,7 @@ start_cluster() {
         fi
     }
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
-        echo "Patching vLLM modelopt_mixed MXFP8 dispatch (festr2 attention fix, Soares C15)..."
+        echo "Patching vLLM modelopt_mixed MXFP8 dispatch (festr2 attention fix)..."
         patch_modelopt_mxfp8_dispatch_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
         for worker in "${PEER_NODES[@]}"; do
             patch_modelopt_mxfp8_dispatch_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
@@ -876,7 +876,7 @@ start_cluster() {
     fi
 
 
-    # SOARES-C17-modelopt-mxfp8-scale-name-patch
+    # MIMO-modelopt-mxfp8-scale-name-patch
     # Fix the actual MXFP8 weight-load bug: ModelOptMxFp8LinearMethod registers
     # the scale parameter as `weight_scale`, but festr2 stores it as
     # `weight_scale_inv` in safetensors. Without this rename, the scale param
@@ -894,7 +894,7 @@ start_cluster() {
         fi
     }
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
-        echo "Patching ModelOptMxFp8 weight_scale -> weight_scale_inv rename (Soares C17)..."
+        echo "Patching ModelOptMxFp8 weight_scale -> weight_scale_inv rename (festr2 scale-name fix)..."
         patch_modelopt_mxfp8_scale_name_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
         for worker in "${PEER_NODES[@]}"; do
             patch_modelopt_mxfp8_scale_name_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
@@ -902,7 +902,7 @@ start_cluster() {
     fi
 
 
-    # SOARES-C25-mimo-qkv-split-patch
+    # MIMO-mimo-qkv-split-patch
     # Fix MiMo-V2 fused qkv_proj loader: original chunk(tp,dim=0)[rank] is wrong
     # for festr2 layout where qkv is fused [Q|K|V] in dim 0 (Q=24576, K=1536,
     # V=1024 for full attention). Split by Q/K/V sizes and use proper loader
@@ -918,7 +918,7 @@ start_cluster() {
         fi
     }
     if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
-        echo "Patching MiMo-V2 fused qkv_proj loader Q/K/V split (Soares C25)..."
+        echo "Patching MiMo-V2 fused qkv_proj loader Q/K/V split (festr2 fused-qkv layout fix)..."
         patch_mimo_qkv_split_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
         for worker in "${PEER_NODES[@]}"; do
             patch_mimo_qkv_split_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null

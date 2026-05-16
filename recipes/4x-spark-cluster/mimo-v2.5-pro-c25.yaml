@@ -1,4 +1,4 @@
-# Cycle 25 (Soares): festr2 with fused qkv_proj split fix
+# festr2 with fused qkv_proj split fix
 # C25 patches vLLM MiMo loader: was using naive chunk(tp_size, dim=0)[rank]
 # for festr2 fused [Q|K|V] tensor; ranks 0-6 got only Q rows in K/V slots.
 # Verified via E8M0 scale-byte distribution (Q mean 114, K mean 116, V mean 113).

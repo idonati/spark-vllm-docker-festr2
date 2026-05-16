@@ -20,7 +20,7 @@ takes care of TP sharding inside each Q/K/V slice. Same approach as the
 existing stacked_params_mapping path for split q_proj/k_proj/v_proj
 checkpoints — just sourced from a single fused tensor.
 
-Author: Soares Mission Control (Cycle 25), 2026-05-15.
+Author: 2026-05-15.
 """
 import sys
 
@@ -42,7 +42,7 @@ if path is None:
     print("SKIP-not-found")
     sys.exit(0)
 
-MARKER = "# SOARES-C25: fix fused qkv_proj loader (proper Q/K/V split)"
+MARKER = "# MIMO-FUSED-QKV-SPLIT-FIX"
 if MARKER in content:
     print("NOOP-already-patched")
     sys.exit(0)

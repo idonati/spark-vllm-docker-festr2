@@ -13,7 +13,7 @@ Coherent output confirmed 2026-05-16. Chat completion `"Say hello"` returns `"He
 | `patch_modelopt_mxfp8_scale_name.py` | Rename `weight_scale_inv` → `weight_scale` in `ModelOptMxFp8LinearMethod.process_weights_after_loading`. festr2 stores the scale under the `_inv`-suffixed key (modelopt convention), but the byte values are *forward* E8M0 — **no byte-flip needed** (`254 - byte` makes it worse). |
 | `patch_mimo_qkv_split.py` | **The real fix.** Replace vLLM's `mimo_v2.py` naive `loaded_weight.chunk(tp_size, dim=0)[tp_rank]` for fused `qkv_proj` with proper `[Q\|K\|V]` slicing + 3× `QKVParallelLinear.weight_loader` calls with `shard_id` `"q"`/`"k"`/`"v"`. Prior code gave 7 of 8 ranks all-Q-region rows in their K/V parameter slots → 7 of 8 ranks computed attention with Q values posing as K and V. Confirmed empirically via E8M0 scale-byte distribution: Q section mean 114.55, K 115.99, V 113.27 (clear Q→K→V layout). |
 | `recipes/4x-spark-cluster/mimo-v2.5-pro-c25.yaml` | Recipe for the [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) `run-recipe.py` wrapper. Uses FlashInferCutlassMxfp8 attention + Marlin NVFP4 MoE + FP8 KV cache + `triton_attn_diffkv` + `enforce_eager` + `--moe-backend marlin`. |
-| `launch-cluster.sh` | The base eugr launcher with all 4 patches wired in (search for `SOARES-C12`, `SOARES-C15`, `SOARES-C17`, `SOARES-C25` markers). Each patch runs inside every node's container at start. |
+| `launch-cluster.sh` | The base eugr launcher with all 4 patches wired in (search for `MIMO-` markers). Each patch runs inside every node's container at start. |
 
 ## Usage
 

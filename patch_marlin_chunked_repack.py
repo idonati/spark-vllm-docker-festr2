@@ -29,7 +29,7 @@ After this patch each helper:
 Peak temp memory: just one per-expert scratch (~750 MiB) instead of the
 accumulated ~36 GiB. Saves enough headroom for the head node to fit.
 
-Author: Soares Mission Control (Cycle 12 v2), 2026-05-13.
+Author: 2026-05-13.
 """
 import re
 import sys
@@ -53,14 +53,14 @@ if path is None:
     print("SKIP-not-found")
     sys.exit(0)
 
-MARKER_V2 = "# SOARES-C12-v2: chunked nvfp4 marlin repack"
+MARKER_V2 = "# MIMO-CHUNKED-NVFP4-MARLIN-REPACK"
 if MARKER_V2 in content:
     print("NOOP-already-patched-v2")
     sys.exit(0)
 
 # Strip the v1 patch first if present (it patched the wrong function and is now
 # harmless but confusing).
-if "# SOARES-C12: chunked marlin repack" in content:
+if "# MIMO-CHUNKED-MARLIN-REPACK" in content:
     print("INFO: v1 marker present (wrong function), continuing with v2 on the right one")
 
 old_repack_weight = '''    # WEIGHT

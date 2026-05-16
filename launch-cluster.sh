@@ -951,6 +951,78 @@ start_cluster() {
     fi
 
 
+    # MIMO-DIFFKV-TURBOQUANT-K8V4 (M1 of design/kv-compression-for-mimo-v2-diffkv.md)
+    # Opt-in only: ENABLE_TQ_K8V4=1 enables the TurboQuant K8V4 KV-cache
+    # path for the 70 diffkv attention layers.  Three components:
+    #   1. mimo_v2.py — pass cache_config to MiMoV2Attention so the global
+    #      --kv-cache-dtype flag actually reaches the impl (fixes a silent
+    #      bug where every layer ended up at "auto" / BF16 regardless).
+    #   2. triton_attn_diffkv.py — accept turboquant_k8v4, branch to TQ
+    #      store/decode kernels with the diffkv slot layout.
+    #   3. New triton_turboquant_diffkv_{store,decode}.py kernels installed
+    #      into /opt/vllm/vllm/v1/attention/ops/.
+    # Off by default.  Production C32 recipe is unaffected.
+    if [[ "${ENABLE_TQ_K8V4:-0}" == "1" ]]; then
+        echo "ENABLE_TQ_K8V4=1: enabling TurboQuant K8V4 diffkv path (experimental)..."
+        # Component 1: mimo_v2 cache_config plumbing
+        patch_mimo_v2_cache_config_in_container() {
+            local target="$1"; local container="$2"; local is_local="$3"
+            local script_path="$HOME/spark-vllm-docker-main/patch_mimo_v2_cache_config.py"
+            if [[ "$is_local" == "true" ]]; then
+                docker cp "$script_path" "$container":/tmp/patch_mimo_v2_cache_config.py
+                docker exec "$container" python3 /tmp/patch_mimo_v2_cache_config.py
+            else
+                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$target" "docker exec -i $container tee /tmp/patch_mimo_v2_cache_config.py >/dev/null && docker exec $container python3 /tmp/patch_mimo_v2_cache_config.py" < "$script_path"
+            fi
+        }
+        if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+            patch_mimo_v2_cache_config_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
+            for worker in "${PEER_NODES[@]}"; do
+                patch_mimo_v2_cache_config_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
+            done
+        fi
+
+        # Component 2: triton_attn_diffkv TurboQuant routing
+        patch_triton_attn_diffkv_turboquant_in_container() {
+            local target="$1"; local container="$2"; local is_local="$3"
+            local script_path="$HOME/spark-vllm-docker-main/patch_triton_attn_diffkv_turboquant.py"
+            if [[ "$is_local" == "true" ]]; then
+                docker cp "$script_path" "$container":/tmp/patch_triton_attn_diffkv_turboquant.py
+                docker exec "$container" python3 /tmp/patch_triton_attn_diffkv_turboquant.py
+            else
+                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$target" "docker exec -i $container tee /tmp/patch_triton_attn_diffkv_turboquant.py >/dev/null && docker exec $container python3 /tmp/patch_triton_attn_diffkv_turboquant.py" < "$script_path"
+            fi
+        }
+        if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+            patch_triton_attn_diffkv_turboquant_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
+            for worker in "${PEER_NODES[@]}"; do
+                patch_triton_attn_diffkv_turboquant_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
+            done
+        fi
+
+        # Component 3: install new TQ-diffkv kernel files
+        install_tq_diffkv_kernels_in_container() {
+            local target="$1"; local container="$2"; local is_local="$3"
+            local store_src="$HOME/spark-vllm-docker-main/triton_turboquant_diffkv_store.py"
+            local decode_src="$HOME/spark-vllm-docker-main/triton_turboquant_diffkv_decode.py"
+            local dst_dir="/opt/vllm/vllm/v1/attention/ops"
+            if [[ "$is_local" == "true" ]]; then
+                docker cp "$store_src" "$container":"$dst_dir/triton_turboquant_diffkv_store.py"
+                docker cp "$decode_src" "$container":"$dst_dir/triton_turboquant_diffkv_decode.py"
+            else
+                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$target" "docker exec -i $container tee $dst_dir/triton_turboquant_diffkv_store.py >/dev/null" < "$store_src"
+                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$target" "docker exec -i $container tee $dst_dir/triton_turboquant_diffkv_decode.py >/dev/null" < "$decode_src"
+            fi
+        }
+        if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+            install_tq_diffkv_kernels_in_container "$HEAD_IP" "$CONTAINER_NAME" "true"
+            for worker in "${PEER_NODES[@]}"; do
+                install_tq_diffkv_kernels_in_container "$worker" "$CONTAINER_NAME" "false"
+            done
+        fi
+    fi
+
+
     # Patch CUTLASS_MLA + FLASHMLA + FLASH_ATTN_MLA to accept sm_12x (GB10).
     # Default supports_compute_capability checks major == 10 (CUTLASS_MLA) or
     # major == 9 / [9,10] (FLASH_ATTN_MLA / FLASHMLA). GB10 is sm_121 (major 12).

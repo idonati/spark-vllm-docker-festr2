@@ -1,0 +1,59 @@
+# Cycle 33: TurboQuant K8V4 KV-cache compression in the diffkv path
+# Status: EXPERIMENTAL — requires ENABLE_TQ_K8V4=1 in the launcher env so
+# the patches in design/kv-compression-for-mimo-v2-diffkv.md M1 are applied.
+# C32 remains the production recipe; C33 is for validation runs only.
+#
+# Expected vs C32 (per design doc): ~2.0-2.5× decode tok/s at 64-200k
+# context.  Numerical correctness vs C32 is the first gate; perf is the
+# second.
+
+recipe_version: "1"
+name: MiMo-V2.5-Pro-C33-TQ-K8V4
+description: K8V4 KV compression for diffkv layers (M1 of KV compression plan)
+
+model: festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8
+container: vllm-node-mimo-pr41797-nccl230-tfgit-sm12x
+
+cluster_only: true
+mods: []
+
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.72
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+  max_num_seqs: 4
+  served_model_name: mimo-v2.5-pro
+
+env:
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  NCCL_NVLS_ENABLE: "0"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  RAY_CGRAPH_get_timeout: "1800"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  # Activate the M1 TurboQuant K8V4 patch path.
+  ENABLE_TQ_K8V4: "1"
+
+command: |
+  vllm serve festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8 \
+    --trust-remote-code \
+    --kv-cache-dtype turboquant_k8v4 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format safetensors \
+    --attention-backend triton_attn_diffkv \
+    --moe-backend marlin \
+    --speculative-config '{{"model": "festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8", "method": "mtp", "num_speculative_tokens": 1}}' \
+    --reasoning-parser qwen3 \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray

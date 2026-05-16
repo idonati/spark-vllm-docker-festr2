@@ -51,6 +51,32 @@ May 15-16: re-investigation found that
 
 The CUTLASS Sm120 hypothesis was wrong. The bug was always in vLLM's load path.
 
+## Thanks
+
+The diagnosis only got this far because so many people shared notes, repros, and patches across upstream issues over the past few weeks. Particular thanks to the upstream contributors whose work this repo builds on:
+
+- **@ZJY0516** — [vllm#41797](https://github.com/vllm-project/vllm/pull/41797) *DiffKV Triton attention backend for MiMo*. The image this repo deploys on is built on top of that PR; without it, MiMo's unequal Q/K head_dim (192/128) wouldn't dispatch to a working backend on sm_121.
+- **@eugr** — author of [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker), the launcher and recipe runner this repo extends. Also a consistent voice across the DGX Spark threads in vLLM and sglang.
+- **@johnnynunez** — [vllm#38126](https://github.com/vllm-project/vllm/pull/38126) *DGX Spark logic fix*, plus careful cross-thread reviewing on most of the sm_121 PRs.
+- **@RobTand** — [vllm#37725](https://github.com/vllm-project/vllm/pull/37725) *Preserve CUDA arch suffix (a/f) for SM12x — fixes NVFP4 NaN on desktop Blackwell*. Critical for any NVFP4 path on sm_121.
+- **@meena-at-work** — [vllm#40082](https://github.com/vllm-project/vllm/pull/40082) *Integrate flashinfer b12x MoE and FP4 GEMM kernels for SM120/121*. Enables the NVFP4 MoE backends we route around in this repo.
+- **@brandonmmusic-max** — [NVIDIA/cutlass#3096](https://github.com/NVIDIA/cutlass/issues/3096) *SM120 NVFP4 MoE garbage output — diagnosis + FlashInfer SM120 patches + compute_120f path*. The clearest write-up of the broader Sm120/Sm121 NVFP4 situation; pointed us at the Marlin workaround long before we found this load-side bug.
+- **@huangyucbr-hub** — [NVIDIA/cutlass#2800](https://github.com/NVIDIA/cutlass/issues/2800) *Python DSL `BlockScaledMmaOp` blocks FP4 on sm_120/sm_121*. The upstream issue that opened up the sm_121 NVFP4 conversation.
+- **@aniskumar-nv** — [flashinfer-ai/flashinfer#2776](https://github.com/flashinfer-ai/flashinfer/issues/2776) *NVFP4 MoE crash on GB10 (SM121) during CUDA graph capture*. The other half of the FlashInfer-side picture.
+- **@haosdent** — [vllm#38476](https://github.com/vllm-project/vllm/pull/38476) *TRITON_MLA_SPARSE for SM8x/11x/12x*. Useful reference for sm_12x backend dispatch.
+- **@yvbbrjdr** — [sgl-project/sglang#11658](https://github.com/sgl-project/sglang/issues/11658) *DGX Spark (GB10, sm_121a) Support Tracking*. The clearinghouse issue on the sglang side, with corresponding garbage-output repros that helped rule in/out symptoms.
+
+And to everyone who chimed in across these threads with diagnostic data, repros, or kernel patches:
+
+- vllm#40082: @AethoceSora, @pavanimajety, @tonyliu312
+- vllm#38126: @gbanyan
+- vllm#38476: @ehfd, @ianlevesque, @workcode-del, @zenglanmu
+- sglang#11658: @Azure-Tang, @Kh4L, @ganisback, @LuYanFCP, @JCorners68, @shaunsingh
+- CUTLASS#2800: @Edenzzzz, @Teora, @bmdhodl, @caelunshun, @kiwi3shark, @mricharz, @osubotin, @vgoklani
+- CUTLASS#3096: @CristyNel, @depaulmillz
+
+If your handle should be on this list and isn't — or shouldn't be and is — please open an issue or PR and I'll fix it.
+
 ## License
 
 Patches are MIT-licensed; the launcher and recipes come from [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) (also MIT).

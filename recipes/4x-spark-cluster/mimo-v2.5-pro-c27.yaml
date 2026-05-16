@@ -1,0 +1,50 @@
+# Cycle 27: long-context (32k) for big-project coding
+
+recipe_version: "1"
+name: MiMo-V2.5-Pro-C27-32kContext
+description: 32k context, 4 concurrent seqs, batched 8192
+
+model: festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8
+container: vllm-node-mimo-pr41797-nccl230-tfgit-sm12x
+
+cluster_only: true
+mods: []
+
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.70
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+  max_num_seqs: 4
+  served_model_name: mimo-v2.5-pro
+
+env:
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  NCCL_NVLS_ENABLE: "0"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  RAY_CGRAPH_get_timeout: "1800"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+command: |
+  vllm serve festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format safetensors \
+    --attention-backend triton_attn_diffkv \
+    --enforce-eager \
+    --moe-backend marlin \
+    --reasoning-parser qwen3 \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray

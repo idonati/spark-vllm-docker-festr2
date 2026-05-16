@@ -102,3 +102,41 @@ Prefill rate inferred: ~3,300 tok/s (the 26k prompt prefilled in ~8 s before dec
 - Decode rate falls from ~9.4 tok/s (short context) to ~5 tok/s (26k context). Attention is the cost: each decode token now does a 26k-token KV read.
 - Prefill is fast enough that codebase ingest is not the user-visible bottleneck — a 16k-token prompt prefills in ~5 s.
 - The large KV cache (696k tokens) leaves room to push `max_model_len` further (64k feasible) or grow `max_num_seqs`.
+
+## C28 — drop --enforce-eager (CUDA graphs)
+
+Same recipe as C27 minus the `--enforce-eager` flag. CUDA graph capture sizes [1, 2, 4, 8] (PIECEWISE + FULL). Capture completed in ~3 s, init engine 101 s total (70 s compilation).
+
+KV cache size at boot: **619,881 tokens** (small reduction vs C27's 696k due to ~0.39 GiB graph pool memory).
+
+### Comparison to C27 (eager)
+
+| Test | C27 eager | C28 CUDA graphs | speedup |
+|---|---|---|---|
+| Math sanity wall | 9.5 s | 4.15 s | 2.3× |
+| Code task 1 (LRU) | 9.41 tok/s | **13.26 tok/s** | **+41%** |
+| Code task 2 (refactor) | 9.40 tok/s | 12.31 tok/s | +31% |
+| Long context (26k) decode | 5.03 tok/s | 5.58 tok/s | +11% |
+| Long context (26k) total | 337 tok/s | **374 tok/s** | +11% |
+| Solo (sweep) | 9.42 tok/s | 12.20 tok/s | +29% |
+| 2 concurrent | 16.88 tok/s | 19.48 tok/s | +15% |
+| 4 concurrent | 35.99 tok/s | 36.31 tok/s | +1% |
+
+### Output quality
+
+| Task | Snippet |
+|---|---|
+| LRU cache | `from collections import OrderedDict\nimport threading\n\ndef lru_cache_simple(maxsize):\n    """Simple LRU cache decorator with a fixed maxsize.\n    Caches up to maxsize results keyed by posi…` |
+| UserRepository refactor | `class UserRepository:\n    def __init__(self, db):\n        self.db = db\n    def _find_by(self, field, value):\n        """Generic` |
+| 26k-token codebase Q | `We are given a series of modules, each with a compute method. The pattern for module i (from 0 to 199) is:\n compute_i(x, y) = (x * (i+1)) + (y * (i+2)) - (3*i)` |
+
+### Observations
+
+- **CUDA graphs work on sm_121 / pr41797 image.** Graph capture (PIECEWISE + FULL) completed without errors. The earlier `--enforce-eager` was conservative; we can drop it.
+- **Speedup is largest at solo and small-batch decode** — kernel launch overhead matters most when each layer's GEMM is small. At 4 concurrent the GEMMs are large enough that overhead is already amortized.
+- **Long-context decode gains less** (+11%) because attention dominates at 26k context, and the attention kernel doesn't benefit from CUDA-graph fusion as much as the per-step GEMMs do.
+- **Coding output quality is solid.** Real-looking Python with imports, docstrings, thread-safety mentions, correct refactor patterns, correct extraction of formulas from long context.
+
+### Recipe note
+
+The working recipe at C28 (in `recipes/4x-spark-cluster/mimo-v2.5-pro-c28.yaml`) is the recommended baseline for coding workloads: 32k context, 4 concurrent, FP8 KV cache, CUDA graphs.

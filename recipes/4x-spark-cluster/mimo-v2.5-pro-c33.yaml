@@ -53,6 +53,7 @@ command: |
     --moe-backend marlin \
     --speculative-config '{{"model": "festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8", "method": "mtp", "num_speculative_tokens": 1}}' \
     --reasoning-parser qwen3 \
+    --enforce-eager \
     --served-model-name {served_model_name} \
     --host {host} \
     --port {port} \

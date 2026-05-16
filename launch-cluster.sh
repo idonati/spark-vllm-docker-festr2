@@ -953,10 +953,13 @@ start_cluster() {
 
     # MIMO-DIFFKV-TURBOQUANT-K8V4 (M1 of design/kv-compression-for-mimo-v2-diffkv.md)
     # Opt-in only: ENABLE_TQ_K8V4=1 enables the TurboQuant K8V4 KV-cache
-    # path for the 70 diffkv attention layers.  Three components:
+    # path for the 70 diffkv attention layers.  Four components:
     #   1. mimo_v2.py — pass cache_config to MiMoV2Attention so the global
     #      --kv-cache-dtype flag actually reaches the impl (fixes a silent
     #      bug where every layer ended up at "auto" / BF16 regardless).
+    #   1b. mimo_v2_mtp.py — same fix for the MTP draft-head layer; without
+    #       it the MTP slot allocation mismatches the main-model slots and
+    #       the engine crashes at first speculative-decode step.
     #   2. triton_attn_diffkv.py — accept turboquant_k8v4, branch to TQ
     #      store/decode kernels with the diffkv slot layout.
     #   3. New triton_turboquant_diffkv_{store,decode}.py kernels installed
@@ -979,6 +982,24 @@ start_cluster() {
             patch_mimo_v2_cache_config_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
             for worker in "${PEER_NODES[@]}"; do
                 patch_mimo_v2_cache_config_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
+            done
+        fi
+
+        # Component 1b: mimo_v2_mtp draft-head cache_config plumbing
+        patch_mimo_v2_mtp_cache_config_in_container() {
+            local target="$1"; local container="$2"; local is_local="$3"
+            local script_path="$HOME/spark-vllm-docker-main/patch_mimo_v2_mtp_cache_config.py"
+            if [[ "$is_local" == "true" ]]; then
+                docker cp "$script_path" "$container":/tmp/patch_mimo_v2_mtp_cache_config.py
+                docker exec "$container" python3 /tmp/patch_mimo_v2_mtp_cache_config.py
+            else
+                ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$target" "docker exec -i $container tee /tmp/patch_mimo_v2_mtp_cache_config.py >/dev/null && docker exec $container python3 /tmp/patch_mimo_v2_mtp_cache_config.py" < "$script_path"
+            fi
+        }
+        if [[ "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" ]]; then
+            patch_mimo_v2_mtp_cache_config_in_container "$HEAD_IP" "$CONTAINER_NAME" "true" >/dev/null
+            for worker in "${PEER_NODES[@]}"; do
+                patch_mimo_v2_mtp_cache_config_in_container "$worker" "$CONTAINER_NAME" "false" >/dev/null
             done
         fi
 

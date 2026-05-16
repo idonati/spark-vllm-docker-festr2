@@ -1,0 +1,56 @@
+# Cycle 25 (Soares): festr2 with fused qkv_proj split fix
+# C25 patches vLLM MiMo loader: was using naive chunk(tp_size, dim=0)[rank]
+# for festr2 fused [Q|K|V] tensor; ranks 0-6 got only Q rows in K/V slots.
+# Verified via E8M0 scale-byte distribution (Q mean 114, K mean 116, V mean 113).
+# Patch splits properly and uses QKVParallelLinear loader with shard_id.
+#
+# Other settings: FlashInferCutlass MXFP8 + Marlin NVFP4 MoE + FP8 KV cache.
+
+recipe_version: "1"
+name: MiMo-V2.5-Pro-C25-QKVSplitFix
+description: Cycle 25 — fused qkv split fix + W8A8 FIC MXFP8 + Marlin NVFP4
+
+model: festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8
+container: vllm-node-mimo-pr41797-nccl230-tfgit-sm12x
+
+cluster_only: true
+mods: []
+
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.65
+  max_model_len: 8192
+  max_num_batched_tokens: 1024
+  max_num_seqs: 1
+  served_model_name: mimo-v2.5-pro
+
+env:
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  NCCL_NVLS_ENABLE: "0"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  RAY_CGRAPH_get_timeout: "1800"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+command: |
+  vllm serve festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format safetensors \
+    --attention-backend triton_attn_diffkv \
+    --enforce-eager \
+    --moe-backend marlin \
+    --reasoning-parser qwen3 \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray

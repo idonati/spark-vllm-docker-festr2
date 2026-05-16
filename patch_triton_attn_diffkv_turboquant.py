@@ -271,6 +271,53 @@ new5 = '''        # ''' + MARKER + '''
                 triton_turboquant_diffkv_decode,
             )
 
+            # CUDA-graph compat: for the decode (q_len==1) path, use a
+            # SHARED class-level scratch buffer allocated ONCE at a generous
+            # fixed capacity.  CUDA graph captures the data pointer at
+            # capture time; reallocating later would free a pointer the
+            # captured graph still references and silently corrupt output.
+            # Shared across all 70 TQ-K8V4 layers since the model has
+            # uniform Hq, head_size_v.  Memory cost: 512*32*8*129*4 = 8 MB.
+            #
+            # Prefill path (max_query_len>1) bypasses this scratch — the
+            # launcher branches to the dequant fallback which allocates its
+            # own per-call buffers and runs eager (not graph-captured).
+            mid_o_scratch_arg = None
+            lse_scratch_arg = None
+            if attn_metadata.max_query_len == 1:
+                q_max = query[:num_actual_tokens].shape[0]
+                Hq_local = query.shape[1]
+                NUM_KV_SPLITS_TQ = 8
+                _TQ_SCRATCH_QMAX_CAPACITY = 512
+                cls = type(self)
+                if not hasattr(cls, "_tq_mid_o_scratch"):
+                    cls._tq_mid_o_scratch = torch.empty(
+                        (_TQ_SCRATCH_QMAX_CAPACITY, Hq_local, NUM_KV_SPLITS_TQ, head_size_v + 1),
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                    cls._tq_lse_scratch = torch.empty(
+                        (_TQ_SCRATCH_QMAX_CAPACITY, Hq_local),
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                    cls._tq_scratch_hq = Hq_local
+                    cls._tq_scratch_hv = head_size_v
+                assert q_max <= cls._tq_mid_o_scratch.shape[0], (
+                    f"TQ-K8V4 scratch capacity exceeded: q_max={q_max} > "
+                    f"capacity={cls._tq_mid_o_scratch.shape[0]}.  Reallocation "
+                    f"would break captured CUDA graphs.  Increase "
+                    f"_TQ_SCRATCH_QMAX_CAPACITY or disable graphs."
+                )
+                assert cls._tq_scratch_hq == Hq_local and cls._tq_scratch_hv == head_size_v, (
+                    "TQ-K8V4 scratch shape mismatch across layers: "
+                    f"alloc Hq={cls._tq_scratch_hq} Hv={cls._tq_scratch_hv}, "
+                    f"call Hq={Hq_local} Hv={head_size_v}.  All TQ layers must "
+                    "have identical head dims to share scratch."
+                )
+                mid_o_scratch_arg = cls._tq_mid_o_scratch
+                lse_scratch_arg = cls._tq_lse_scratch
+
             triton_turboquant_diffkv_decode(
                 query=query[:num_actual_tokens],
                 kv_cache=kv_cache,
@@ -283,6 +330,8 @@ new5 = '''        # ''' + MARKER + '''
                 head_size_q=head_size_qk,
                 head_size_v=head_size_v,
                 tq_config_k=self._tq_config,
+                mid_o_scratch=mid_o_scratch_arg,
+                lse_scratch=lse_scratch_arg,
             )
             return output
 

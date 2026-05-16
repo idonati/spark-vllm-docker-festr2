@@ -200,6 +200,8 @@ def triton_turboquant_diffkv_decode(
     head_size_q: int,
     head_size_v: int,
     tq_config_k,
+    mid_o_scratch: torch.Tensor | None = None,  # pre-allocated [B_max, Hq, NUM_KV_SPLITS, head_size_v+1]
+    lse_scratch: torch.Tensor | None = None,    # pre-allocated [B_max, Hq]
 ):
     """K8V4 decode launcher for diffkv layouts.
 
@@ -208,6 +210,12 @@ def triton_turboquant_diffkv_decode(
     the kernel above is decode-only (one q per request).  Long-context
     decode is the optimization target so the prefill fallback is
     acceptable for M1.
+
+    For CUDA-graph compatibility on the decode path, callers should pass
+    persistent pre-allocated ``mid_o_scratch`` and ``lse_scratch`` buffers
+    (sized at max batch).  When omitted, fresh buffers are allocated per
+    call (graph-unfriendly but functional — used by the prefill fallback
+    which runs eager anyway, and by unit tests).
     """
     if max_seqlen_q > 1:
         # Prefill fallback: dequantize cache to bf16 and call SDPA.
@@ -240,11 +248,24 @@ def triton_turboquant_diffkv_decode(
     stride_cache_pos = num_kv_heads * slot_size
     stride_cache_head = slot_size
 
-    mid_o = torch.empty(
-        (B, Hq, NUM_KV_SPLITS, head_size_v + 1),
-        dtype=torch.float32,
-        device=query.device,
-    )
+    if mid_o_scratch is not None:
+        # Reuse pre-allocated scratch.  Slice the leading dim down to B; the
+        # kernel writes only to the active rows.  Stride 0 is preserved on
+        # the slice, so the kernel's stride-based indexing is unchanged.
+        assert mid_o_scratch.shape[0] >= B, (
+            f"mid_o_scratch dim 0 ({mid_o_scratch.shape[0]}) < B ({B})"
+        )
+        assert mid_o_scratch.shape[1:] == (Hq, NUM_KV_SPLITS, head_size_v + 1), (
+            f"mid_o_scratch trailing dims {mid_o_scratch.shape[1:]} != "
+            f"({Hq}, {NUM_KV_SPLITS}, {head_size_v + 1})"
+        )
+        mid_o = mid_o_scratch[:B]
+    else:
+        mid_o = torch.empty(
+            (B, Hq, NUM_KV_SPLITS, head_size_v + 1),
+            dtype=torch.float32,
+            device=query.device,
+        )
 
     grid_stage1 = (B, Hq, NUM_KV_SPLITS)
     _tq_diffkv_decode_stage1_k8v4[grid_stage1](
@@ -279,7 +300,13 @@ def triton_turboquant_diffkv_decode(
 
     # Stage 2: LSE reduce across NUM_KV_SPLITS partials.
     # The shared TQ decode stage2 expects a separate LSE output tensor.
-    lse = torch.empty((B, Hq), dtype=torch.float32, device=query.device)
+    if lse_scratch is not None:
+        assert lse_scratch.shape[0] >= B and lse_scratch.shape[1] == Hq, (
+            f"lse_scratch shape {lse_scratch.shape} incompatible with (B={B}, Hq={Hq})"
+        )
+        lse = lse_scratch[:B]
+    else:
+        lse = torch.empty((B, Hq), dtype=torch.float32, device=query.device)
     _fwd_kernel_stage2[(B, Hq)](
         mid_o,
         output,

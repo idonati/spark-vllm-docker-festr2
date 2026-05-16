@@ -67,3 +67,38 @@ KV cache size at boot: 52,036 tokens (the large `max_num_batched_tokens` reserve
 - Drop `--enforce-eager` to enable CUDA-graph decode. Likely +30-50% on solo and batched decode if warmup survives sm_121 graph-capture issues.
 - Long-context behavior at `max_model_len` 32k / 64k (untested).
 - Prefill throughput on real codebase-sized prompts (untested).
+
+## C27 — 32k context
+
+`max_model_len=32768`, `max_num_seqs=4`, `max_num_batched_tokens=8192`, `gpu_memory_utilization=0.70`. KV cache size at boot: **696,354 tokens**.
+
+### Short-prompt decode (single)
+
+| Task | prompt (tok) | decode (tok) | wall (s) | decode tok/s |
+|---|---|---|---|---|
+| Math sanity | ~30 | 30 | 9.53 | ~9.4 |
+| LRU cache from scratch | 297 | 400 | 42.49 | 9.41 |
+| Refactor UserRepository | 487 | 584 | 62.10 | 9.40 |
+
+### Long-prompt decode (single)
+
+| Task | prompt (tok) | decode (tok) | wall (s) | decode tok/s | total tok/s |
+|---|---|---|---|---|---|
+| 200-module fake codebase Q | **26,411** | 400 | 79.51 | 5.03 | **337.22** |
+
+Prefill rate inferred: ~3,300 tok/s (the 26k prompt prefilled in ~8 s before decode started).
+
+### Concurrent decode at max_num_seqs=4 (short prompts, 200-tok decode)
+
+| concurrent | wall (s) | decode total | agg tok/s | speedup |
+|---|---|---|---|---|
+| 1 | 21.22 | 200 | 9.42 | 1.0× |
+| 2 | 23.70 | 400 | 16.88 | 1.8× |
+| 4 | 22.23 | 800 | **35.99** | **3.8×** |
+
+### Observations
+
+- 32k context behaves coherently — model correctly answered a question requiring it to read and reason over a 26k-token "codebase".
+- Decode rate falls from ~9.4 tok/s (short context) to ~5 tok/s (26k context). Attention is the cost: each decode token now does a 26k-token KV read.
+- Prefill is fast enough that codebase ingest is not the user-visible bottleneck — a 16k-token prompt prefills in ~5 s.
+- The large KV cache (696k tokens) leaves room to push `max_model_len` further (64k feasible) or grow `max_num_seqs`.

@@ -187,3 +187,161 @@ C32's output adds a field whitelist, a stronger defensive-coding pattern than C2
 ### Recipe
 
 `recipes/4x-spark-cluster/mimo-v2.5-pro-c31.yaml` (the same recipe that was used for C31; the difference between C31 and C32 is the `patch_mimo_v2_mtp_qkv_split.py` fix wired into the launcher).
+
+## C34 — perf characterization (decode cost decomposition, 2026-05-19)
+
+Same recipe as C32, same fork, but on a fresher vLLM snapshot (`v0.1.dev1+g0891716c2.d20260509`). Asynchronous scheduling is enabled by default in this build. Goal: decompose decode cost into fixed-per-step overhead vs context-scaling KV-read.
+
+> Important: per the M0 finding in `design/kv-compression-for-mimo-v2-diffkv.md`, `--kv-cache-dtype fp8` is silently dropped by MiMo-V2 due to missing `cache_config` plumbing — so the cache here is **BF16** (640 bytes/slot at the 10 full-attn layers), not FP8 as the log line claims.
+
+### Headline: ~2× across the board vs C32
+
+| Config | C32 | C34 | ratio |
+|---|---|---|---|
+| Solo decode (short ctx) | 17.88 tok/s | 33.55 tok/s | **1.88×** |
+| Solo decode at 26k | 5.58 tok/s | 26.96 tok/s | **4.83×** |
+| 2 concurrent (aggregate) | 28.74 tok/s | 48.74 tok/s | 1.70× |
+| 4 concurrent (aggregate) | 50.89 tok/s | 83.59 tok/s | 1.64× |
+
+The 26k jump is by far the most dramatic — the per-step overhead came down so far that the long-context attention cost no longer drags the rate to a crawl. Most likely source of the headline gains: asynchronous scheduling.
+
+### Method
+
+Streaming OpenAI chat completion at 6 context lengths, 100-token decode each, `ignore_eos=True`. Streaming chunks count was de-aliased to MTP token count via the engine's `usage.completion_tokens`. Per-token decode time fit with a single-axis linear model.
+
+### Results
+
+| ctx (tok) | prefill (s) | decode (s) | decode_tok/s | ms/tok |
+|---|---|---|---|---|
+| 531 | 0.23 | 2.92 | 33.55 | 29.8 |
+| 4373 | 0.22 | 2.96 | 33.15 | 30.2 |
+| 8441 | 0.25 | 3.18 | 30.84 | 32.4 |
+| 16690 | 0.26 | 3.28 | 29.86 | 33.5 |
+| 22905 | 0.29 | 3.45 | 28.40 | 35.2 |
+| 26973 | 0.32 | 3.64 | 26.96 | 37.1 |
+
+**Linear fit:** `decode_ms/tok = 29.5 + 0.265 × (ctx / 1k)`
+
+| component | value | share at 26k |
+|---|---|---|
+| Intercept (fixed per-step) | 29.5 ms/tok | **81%** |
+| Slope (per 1k ctx KV-read) | 0.265 ms/tok per 1k | **19%** |
+
+### Interpretation — what this means for C33
+
+Pure-bandwidth-bound prediction for the slope, given 10 full-attn layers × (192 K + 128 V) × 2 bytes BF16 × 1 KV head per rank at TP=8 and assuming ~30 GB/s effective LPDDR5X under Triton paged attention: **~0.2 ms/tok per 1k context**. Measured 0.265 → close to bandwidth-bound but with some kernel-arithmetic component. Triton attention on GB10 sm_121 is essentially saturating memory bandwidth.
+
+This bounds C33's upside. C33 (TQ-K8V4) reduces slot bytes 640 → 260 (2.46×), so it can compress the *slope* by that factor — but it does **not** compress the intercept.
+
+Projected C33 decode tok/s, assuming the slope drops by 2.46× and the intercept is unchanged:
+
+| ctx | C34 ms/tok | C33 projected ms/tok | C33 projected tok/s | C33 vs C34 |
+|---|---|---|---|---|
+| 26k | 37.1 | 32.3 | 31.0 | +15% |
+| 64k | 46.5 | 36.4 | 27.5 | +28% |
+| 128k | 63.5 | 43.3 | 23.1 | +47% |
+| 200k | 82.5 | 51.0 | 19.6 | +62% |
+
+The original `design/kv-compression-for-mimo-v2-diffkv.md` projected "2-2.5× at 64-200k context"; the actual bound given the now-measured intercept is **~1.6× at 200k**, not 2-2.5×. The design doc was estimated against an older, slower fixed-cost baseline. The async-scheduling improvement in this build effectively pre-spent most of C33's win at the lengths people actually use (≤32k).
+
+### What attacks the 29.5 ms intercept
+
+At batch=1 the intercept is the sum of (a) per-layer kernel launch overhead × 70 layers, (b) NCCL allreduce × 70, (c) MoE GEMM time at batch=1 (latency-bound), (d) SWA attention at window=128 × 60 layers, (e) sampling + MTP draft+verify overhead. The biggest wins by hypothesis:
+
+1. **Higher batch size**. At 2 concurrent: 48.7/33.6 = 1.45× of solo (vs ideal 2×). At 4: 83.6/33.6 = 2.49× (vs ideal 4×). MoE GEMMs are still latency-bound up to batch ~4 — increasing `max_num_seqs` past 4 should unlock more aggregate throughput at modest per-request latency cost.
+2. **Native NVFP4 MoE via cutlass-dsl 4.5.1** (when it works on sm_121a). Removes the FP4→FP8 dequant Marlin currently does per token.
+3. **Better cudagraph coverage**. Recipe captures `[1,2,4,8,16]` only. Real serving sees odd batch sizes that fall back to eager. Either widen capture set or use full-graph mode.
+
+### Per-config decode rate matrix (sweep, max_tokens=100)
+
+| ctx | bsz=1 | bsz=2 | bsz=4 |
+|---|---|---|---|
+| 256 | 33.5 / 33.5 | 24.4 / 48.7 | 20.9 / 83.6 |
+| 26k | 28.5 / 25.7 | 24.3 / 42.2 | 20.9 / 73.3 |
+
+(format: per-request tok/s / aggregate tok/s)
+
+The 26k row is the surprise. **4-concurrent at 26k = 73.3 tok/s aggregate** — only 12% below the 83.6 tok/s aggregate at short context. Batching amortizes the per-step fixed cost across requests, so the long-context drag becomes a thinner slice of overall serving throughput. For four engineers working on a 26k-context codebase that's ~18 tok/s effective per user — equivalent to old C32 solo at short context.
+
+### Recommendation
+
+Reorder. The asynchronous-scheduling-driven 2-5× pickup means **C33 is no longer the highest-leverage next move**. Better order:
+1. **Headroom sweep** — push `max_num_seqs` past 4, widen cudagraph capture, measure 32k-context-at-batch-4. Mechanical, no code changes.
+2. **Cutlass-dsl 4.5.1 native NVFP4** — attacks the fixed-cost MoE term (hassan-abdallah confirmed sm_120a works; sm_121a re-test owed to NVIDIA/cutlass#3227 anyway).
+3. **C33 (TQ-K8V4)** — defer; useful at 64k+ contexts as a +28-62% layer but the Ray init hang debug investment buys less than the design doc projected.
+
+### Recipe
+
+Same as C32 — `recipes/4x-spark-cluster/mimo-v2.5-pro-c31.yaml` + the always-applied MTP qkv-split patch. The build difference (vs the C32 measurement) is the underlying vLLM snapshot picking up async scheduling.
+
+## C34a — headroom sweep: max_num_seqs=16, widened cudagraph capture
+
+Same build as C34, recipe bumped to `max_num_seqs=16`, `max_num_batched_tokens=16384`, and `cudagraph_capture_sizes=[1,2,4,6,8,12,16,24,32]` (was vLLM default `[1,2,4,8,16]`).
+
+### Headline
+
+**16-concurrent at short context = 201 tok/s aggregate. 8-concurrent at 26k = 125 tok/s aggregate.** Per-request decode rate at 26k is *the same* at 4-conc and 8-conc (18.74 vs 18.78) — batching at long context is essentially free up to at least 8 simultaneous requests.
+
+For a team of 8 engineers on 26k-token codebases, that's **22× the published C32 solo rate** of 5.58 tok/s.
+
+### Solo + linear fit (cross-check against C34)
+
+| ctx | decode_tok/s | ms/tok |
+|---|---|---|
+| 531 | 31.4 | 31.9 |
+| 4373 | 33.0 | 30.3 |
+| 8441 | 27.3 | 36.7 |
+| 16690 | 29.1 | 34.4 |
+| 22905 | 28.8 | 34.8 |
+| 26973 | 27.4 | 36.5 |
+
+**Linear fit:** `decode_ms/tok = 31.9 + 0.161 × (ctx/1k)`. Intercept slightly worse than C34 (29.5 → 31.9, +8%), slope notably better (0.265 → 0.161, -39%). The intercept bump is most likely a small cudagraph-warmup/overhead tax from capturing 9 batch sizes; the slope drop is more interesting and consistent with the wider capture set covering odd batch sizes that previously hit eager.
+
+### Concurrent throughput
+
+#### Short context (~256 tok prompt)
+
+| concurrent | per-req tok/s | aggregate tok/s |
+|---|---|---|
+| 1 | 34.2 | 29.9 |
+| 4 | 25.6 | 83.8 |
+| 8 | 22.2 | **157.0** |
+| 12 | 16.2 | 171.4 |
+| 16 | 14.0 | **201.0** |
+
+Scaling efficiency:
+- 1 → 8 conc: 5.25× aggregate (vs ideal 8×, 66% efficient)
+- 8 → 16 conc: 1.28× aggregate (vs ideal 2×, 64% efficient)
+
+We're past the knee at 12-conc. Above 12, per-request latency degrades faster than aggregate gains.
+
+#### Long context (~26k tok prompt)
+
+| concurrent | per-req tok/s | aggregate tok/s |
+|---|---|---|
+| 1 | 26.9 | 24.6 |
+| 4 | 18.7 | 64.9 |
+| 8 | 18.8 | **124.9** |
+
+The surprise: **per-request flat from 4→8 at 26k.** Doubling batch doubles aggregate without paying anything per-request. Likely because at 26k the attention KV-read amortizes well across the batch (each layer reads its cache once, multiple queries use the same cache), and the MoE GEMM at batch=8 is closer to its compute-bound regime than at batch=4.
+
+### Observations / implications
+
+- **For solo coding** (one user at a time), C34a is no improvement over C34 — solo decode hasn't changed. The whole point of C34a is multi-user serving.
+- **For a 4-engineer team** at 26k codebases: 18.7 tok/s per user, 65 tok/s aggregate.
+- **For an 8-engineer team** at 26k codebases: 18.8 tok/s per user (same as 4-team), 125 tok/s aggregate.
+- **Concurrent serving was the highest-leverage lever** the C34 analysis identified, and C34a confirms it — pushing past `max_num_seqs=4` unlocks 2× more aggregate throughput at long context with no per-request degradation, and 2.4× at short context.
+- **Diminishing returns at 12+ concurrent** on short context. The recipe `max_num_seqs=16` is roughly right; 32 would only add ~30% more aggregate at the cost of per-request rates dropping below 10 tok/s.
+- The C33 case is weakened further. C33's projection assumed solo decode improvements; concurrent serving was always going to be the cheaper path.
+
+### Recipe
+
+`recipes/4x-spark-cluster/mimo-v2.5-pro-c34a.yaml` — same as c31.yaml with `max_num_seqs: 16`, `max_num_batched_tokens: 16384`, and `--compilation-config '{"max_cudagraph_capture_size": 32, "cudagraph_capture_sizes": [1,2,4,6,8,12,16,24,32]}'`.
+
+### Recommendation update vs C34
+
+The new priority order after C34a:
+
+1. **Cutlass-dsl 4.5.1 native NVFP4 MoE** (task #60) — still attacks the intercept (now 31.9 ms in C34a, 29.5 in C34). With native NVFP4 the per-step intercept could drop meaningfully, lifting per-request decode rate across all batch sizes. See `design/c35-cutlass451-plan.md`.
+2. **Try `max_num_seqs=24-32`** with a long-context grid — current sweep covers up to 8 at 26k; whether 12-conc-at-26k still scales linearly is an open question.
+3. **C33 (TQ-K8V4)** — definitively deferred. Even at 64k+ contexts, the upside is now bounded against a *much* higher baseline (e.g., 125 tok/s aggregate at 8-conc 26k).

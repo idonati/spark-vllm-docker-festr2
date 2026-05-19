@@ -545,3 +545,36 @@ festr2 and GLM have well-tuned prefill paths. DSV4-Flash prefill is ~10× slower
 ### Bench script
 
 `/home/idonati/profiles/bench_c37_longctx.py` — auto-detects model, runs 5-point context grid via the OpenAI streaming API, separates prefill and decode timing. Output appended to `/home/idonati/profiles/c37_results.jsonl`.
+
+## C38 — long-context concurrent serving across models (16k ctx, 1/4/8 conc)
+
+The remaining cross-model gap: C36 covered concurrent at *short* ctx, C37 covered *solo* long-ctx, but no per-model picture of concurrent serving at long context. C38 fills that gap with all three long-ctx-capable models benched at 16k tokens × 1/4/8 concurrent.
+
+| conc | festr2 C34b @16k | GLM-5.1 (IT) @16k | DSV4-Flash @16k |
+|---|---|---|---|
+| 1 | 6.91 agg / 6.91 per-req | 2.33 / 2.33 | 1.05 / 1.05 |
+| 4 | **63.99** / 16.40 | 31.69 / 7.97 | 21.00 / 5.26 |
+| 8 | **110.96** / 14.36 | 49.36 / 6.20 | 22.52 / 2.82 |
+
+(Numbers in tok/s. conc=1 includes the full cold-prefill cost in the wall time, so don't read those as steady-state decode rates — compare to C37 for that. 4-conc and 8-conc numbers are the production-realistic ones.)
+
+### Observations
+
+- **festr2 is the dominant long-context server** at every batch size. 111 tok/s aggregate at 8-conc 16k = 13.9 tok/s effective per user for an 8-engineer team. GLM gives 6.2 tok/s per user at the same batch (49 aggregate); DSV4-Flash gives 2.8 tok/s per user (22.5 aggregate).
+- **DSV4-Flash plateaus between 4 and 8 concurrent at 16k** (21 → 22.5 agg). The model can't usefully serve more than ~4 simultaneous long-context users on this cluster. Likely bound on prefill throughput rather than decode.
+- **GLM scales close to linearly 4 → 8 conc** (31.7 → 49.4, 1.56×). Reasonable serving headroom at long context.
+- **festr2 scales 4 → 8 conc by 1.73× at 16k** (64 → 111). Close to the C34a 4→8 scaling we measured at 26k context (65 → 125 ≈ 1.92×).
+
+### Recommendation matrix (16k context, multi-user serving)
+
+| team size at 16k context | festr2 per-user | GLM per-user | DSV4-Flash per-user |
+|---|---|---|---|
+| 1 (solo, warm decode) | ~27 tok/s (C37) | ~13 tok/s (C37) | ~12 tok/s (C37) |
+| 4 | 16 tok/s | 8 tok/s | 5 tok/s |
+| 8 | 14 tok/s | 6 tok/s | 3 tok/s |
+
+For coding-team work at long context, **festr2 is the only model that holds a usable per-user decode rate (14 tok/s) at 8 concurrent users**. GLM is viable for a 4-person team. DSV4-Flash should be limited to ≤4 concurrent long-ctx users.
+
+### Bench script
+
+`/home/idonati/profiles/bench_c38_longctx_conc.py` — 1/4/8-conc at parameter-able context length. Results in `/home/idonati/profiles/c38_results.jsonl`.

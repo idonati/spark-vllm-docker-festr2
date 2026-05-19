@@ -1,0 +1,90 @@
+# Recipe: Moonshot Kimi-K2.6-NVFP4 on 8× DGX Spark (TP=8)
+# RedHatAI's NVFP4 requantization of moonshotai/Kimi-K2.6.
+# 551 GB checkpoint, 119 safetensors shards → ~70 GB / rank at TP=8.
+#
+# 2026-05-06: pivoted from INT4-QAT (compressed-tensors WNA16) to NVFP4 because
+# the original INT4 path triggers a NCCL collective hang at first inference on
+# GB10 sm_121. Six launch attempts confirmed: weights load and KV-cache profile
+# OK, but the very first NCCL collective in serving phase hangs (PyTorch NCCL
+# watchdog 600s timeout → SIGTERM → ActorDiedError). V4-Flash uses NVFP4-style
+# (deepseek_v4_fp8) kernels and works on this same cluster — so we put K2.6
+# on the same kernel path.
+#
+# Per https://forums.developer.nvidia.com/t/366325 (Qwen3.5-NVFP4 multi-node
+# DGX Spark working recipe) + community findings (vLLM #35848, Ray #58426):
+# - Use NVFP4 quantization, not compressed-tensors WNA16
+# - --moe-backend cutlass (NOT triton or marlin)
+# - --attention-backend flashinfer
+# - Do NOT use --enforce-eager (cutlass moe_fp4 combine requires CUDA graphs)
+# - Patch nvidia_cutlass_dsl/.../tcgen05/mma.py BlockScaledMmaOp.admissible_archs
+#   to include Arch.sm_120a + Arch.sm_121a (auto-applied by launch-cluster.sh)
+#
+# Image: vllm-node-eugr-latest (built from upstream eugr/spark-vllm-docker@main).
+# Includes zyang-dev/nccl@dgxspark-3node-ring (sm_121 native NCCL build) and
+# nvidia_cutlass_dsl with the BlockScaledMmaOp Arch enum.
+#
+# Weights: pre-distributed to all 8 nodes via rsync from AO1. Path is direct
+# (not HF-hub-format), so model: must be the absolute path.
+#
+# AO5/AO6 disks are degraded — Ray bootstrap timeout patch + tmpfs /tmp/ray
+# auto-applied by launch-cluster.sh. See BLOCKERS / RUNBOOK for full details.
+
+recipe_version: "1"
+name: Kimi-K2.6-NVFP4-InstantTensor
+description: "Kimi-K2.6-NVFP4 + --load-format instanttensor (C36 cross-model bench)"
+
+# Direct path — weights rsync'd from AO1 to /root/.cache/huggingface/redhat-Kimi-K2.6-NVFP4
+model: /root/.cache/huggingface/redhat-Kimi-K2.6-NVFP4
+container: vllm-node-eugr-latest-nccl230
+
+build_args: []
+
+cluster_only: true
+mods: []
+
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.85
+  max_model_len: 8192
+  max_num_batched_tokens: 4096
+  served_model_name: kimi-k2.6
+
+env:
+  # 2026-05-09: K2.6 + NCCL 2.30.4 hangs at MoE _load_w2 unless NVLS
+  # (NVLink Sharp) is disabled. DGX Spark uses C2C/RoCE not NVLink so NVLS
+  # is a no-op anyway. Tested: needed only for K2.6 (384 experts), not for
+  # GLM/V4 stacks. Per the NCCL 2.30.4 upgrade arc in vLLM #40969.
+  NCCL_NVLS_ENABLE: "0"
+  RAY_CGRAPH_get_timeout: "1800"
+  NCCL_DEBUG: "WARN"
+  # Offline mode for workers (no internet)
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+command: |
+  vllm serve /root/.cache/huggingface/redhat-Kimi-K2.6-NVFP4 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format instanttensor \
+    --moe-backend cutlass \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser kimi_k2 \
+    --reasoning-parser kimi_k2 \
+    --mm-encoder-tp-mode data \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray
+    # NOTE: --enforce-eager removed — cutlass moe_fp4 combine requires CUDA graphs.
+    # --moe-backend cutlass: matches NVFP4 path V4-Flash uses successfully on GB10.
+    # --attention-backend: omitted — vLLM auto-selects (TRITON_MLA for Kimi MLA).
+    #   FlashInfer rejects K2.6 MLA: "head_size not supported, MLA not supported".
+    # Tool/reasoning parser: kimi_k2 (per RedHatAI model card examples).

@@ -1,0 +1,115 @@
+# Recipe: lukealonso/GLM-5.1-NVFP4 on 8× DGX Spark (TP=8)
+# GLM 5.1 in NVFP4 (4-bit float, group_size=16, llmcompressor format).
+# arch=GlmMoeDsaForCausalLM, model_type=glm_moe_dsa.
+# 434 GB checkpoint → ~54 GB / rank at TP=8.
+#
+# 2026-05-09 update — image upgraded again to `vllm-node-pr38476-nccl230-sm12x`
+# (= pr38476 base + NCCL 2.30.4 layered on top via Dockerfile.pr38476-nccl230).
+# Per @jasl request in vLLM #40969: NCCL 2.30.4 ELIMINATES the Ray Compiled-DAG
+# wedge entirely — confirmed via 50/50 clean sustained sweep at 13.58 tok/s,
+# vs prior NCCL 2.28.9 wedge at request ~37-45. Production endpoint should be
+# substantially more reliable; watchdog still runs as belt-and-suspenders.
+#
+# 2026-05-08 baseline — image upgraded from `vllm-node-main-sm12x` to
+# `vllm-node-pr38476-sm12x` (built from haosdent/vllm@fix-38006, vLLM PR #38476).
+# Same Dockerfile recipe as Dockerfile.main-sm12x but cloning haosdent's PR
+# branch instead of vllm-project main. Empirically gives +48% throughput
+# (13.6 vs 9.21 tok/s) over the main-sm12x image with identical config;
+# sparse-MLA path was tested but doesn't fix the wedge and is slower for short
+# prompts, so we ship in force-dense mode for the perf win.
+#
+# 2026-05-07 baseline — `vllm-node-main-sm12x` had:
+# - GLM-5.1-specific patches baked in: VLLM_MLA_FORCE_DENSE env var,
+#   indexer-weight skip, DeepGEMM, PR #40923 Marlin sm_12x, PR #39594.
+# - Earlier attempt to use the eugr image failed with "Sparse Attention
+#   Indexer CUDA op requires DeepGEMM to be installed" — eugr ships without
+#   DeepGEMM and without VLLM_MLA_FORCE_DENSE.
+#
+# GLM-5.1-NVFP4-specific env vars (per d.nola's working 4-Spark recipe + flashinfer #2776):
+#   - VLLM_MLA_FORCE_DENSE=1         → force dense MLA, skip the sparse Indexer.
+#                                       Without this, GLM tries to instantiate
+#                                       SparseAttnIndexer which needs DeepGEMM and
+#                                       sm_121-incompatible kernels.
+#   - VLLM_USE_FLASHINFER_MOE_FP4=0  → force CUTLASS NVFP4 MoE path. FlashInfer
+#                                       TRTLLM FP4 MoE has a workspace-alignment
+#                                       bug (flashinfer #2776) that crashed AO4
+#                                       on previous attempts.
+#   - VLLM_NVFP4_GEMM_BACKEND=cutlass → same reason, force cutlass GEMM (NOT TRTLLM).
+#   - --attention-backend triton_mla  → explicit; FLASHINFER_MLA rejects qk_nope_head_dim=192.
+#
+# References:
+#   - NVIDIA forum (d.nola working setup): https://forums.developer.nvidia.com/t/glm-5-1-on-hugging-face-is-this-model-going-to-run-on-a-single-spark-how-many-will-be-necessary/365937
+#   - flashinfer #2776: https://github.com/flashinfer-ai/flashinfer/issues/2776
+#   - K2.6 lessons: see K2.6_LESSONS_LEARNED.md (cute mma.py + TRITON_MLA BLOCK=16 patches conceptually apply)
+
+recipe_version: "1"
+name: GLM-5.1-NVFP4-InstantTensor
+description: "GLM-5.1-NVFP4 + --load-format instanttensor (C36 cross-model bench)"
+
+model: lukealonso/GLM-5.1-NVFP4
+container: vllm-node-pr38476-nccl230-sm12x
+
+build_args:
+  - -f
+  - Dockerfile.pr38476-nccl230
+  - --gpu-arch
+  - "12.0;12.1"
+
+cluster_only: true
+mods: []
+
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.65   # 0.85 caused kernel-OOM that took AO4 offline previously; keep conservative
+  max_model_len: 65536
+  max_num_batched_tokens: 8192
+  max_num_seqs: 32
+  served_model_name: glm-5.1-nvfp4
+
+env:
+  # GLM-5.1 specific: force dense MLA (skip sparse Indexer that needs DeepGEMM + sm_121-incompatible kernels)
+  VLLM_MLA_FORCE_DENSE: "1"
+  # GLM-5.1-NVFP4 specific: force CUTLASS path (FlashInfer TRTLLM FP4 has workspace bug)
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+  VLLM_NVFP4_GEMM_BACKEND: "cutlass"
+  # 2026-05-09: NCCL 2.30.4 (in pr38476-nccl230 image) ELIMINATED the Ray
+  # Compiled-DAG wedge that this env var was a partial workaround for.
+  # Keeping OVERLAP_COMM=1 since it had no negative effect on throughput
+  # (13.58 tok/s sustained 50/50 clean) and per @jasl recommendation. If
+  # NCCL is reverted to 2.28.9, this knob becomes critical again (wedge moves
+  # from instant ~7-13 to delayed ~37-45 with this enabled).
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  # Standard cluster knobs
+  RAY_CGRAPH_get_timeout: "1800"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+command: |
+  vllm serve lukealonso/GLM-5.1-NVFP4 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format instanttensor \
+    --attention-backend triton_mla \
+    --enable-prefix-caching \
+    --enforce-eager \
+    --enable-auto-tool-choice \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45 \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray
+    # Notes:
+    # --attention-backend triton_mla: explicit; flashinfer_mla rejects qk_nope_head_dim=192
+    # --load-format instanttensor: not fastsafetensors (NCCL broadcast hang on sm_121)
+    # --moe-backend not specified: vLLM auto-selects based on env vars (cutlass forced via env)
+    # Image's vLLM version is older than eugr's, so --moe-backend may not be a valid arg.

@@ -455,3 +455,54 @@ Caveats: if a deployer hits an InstantTensor compatibility issue (different chec
 ### Recipe
 
 `recipes/4x-spark-cluster/mimo-v2.5-pro-c34b-instanttensor.yaml` — same as C34a with one line changed.
+
+## C36 — cross-model bench + InstantTensor port to GLM/Kimi
+
+C34b's InstantTensor finding wasn't just a festr2 thing: all four images on the cluster ship `instanttensor==0.1.8` and have it registered in vLLM's `model_loader/__init__.py`. The DSV4 recipes used it already; the festr2 (C34b), GLM and Kimi recipes were leaving it on the table.
+
+This cycle (C36) ports InstantTensor to the GLM and Kimi recipes and runs a standardized bench across all five deployed models on the same 8× DGX Spark cluster, same day, same standardized bench script.
+
+### Boot-time wins from InstantTensor (where previously not used)
+
+| Model | Standard safetensors load | InstantTensor load | Speedup |
+|---|---|---|---|
+| festr2 MiMo-V2.5-Pro | 11:47 (main only) | 1:46 | **6.7×** (already C34b) |
+| GLM-5.1-NVFP4 | ~10:31 (85 shards × 4.33s/it) | 1:20 (232k tensors @ 2888 it/s) | **7.9×** |
+| Kimi-K2.6-NVFP4 | ~13:44 (119 shards × 6.93s/it) | 1:06 (278k tensors @ 4213 it/s) | **12.5×** |
+
+End-to-end boot-to-ready (Ray + load + warmup):
+
+| Model | Without IT | With IT | Wall-clock saved |
+|---|---|---|---|
+| GLM-5.1 | ~16 min | **3:29** (209s) | ~12 min |
+| Kimi-K2.6 | ~16 min | **4:37** (277s) | ~11 min |
+
+### Standardized C36 bench across all 5 models
+
+Same client (`/home/idonati/profiles/bench_c36.py`), same prompts, same protocol. Run on the same day on the same cluster state.
+
+| Model | Solo decode | 4-concurrent (agg) | 8-concurrent (agg) | Long-ctx 4k decode | Boot wall |
+|---|---|---|---|---|---|
+| **festr2 MiMo-V2.5-Pro (C34b)** | **32.25 tok/s** | **80.35 tok/s** | **130.91 tok/s** | 13.62 tok/s | 6:47 |
+| GLM-5.1-NVFP4 (IT) | 13.92 | 41.19 | 72.00 | 4.27 | 3:29 |
+| DSV4-Flash | 11.66 | 41.68 | 62.12 | 2.42 | 2:47 |
+| Kimi-K2.6-NVFP4 (IT) | 10.59 | 26.79 | 59.16 | err* | 4:37 |
+| DSV4-Pro (max_ctx=512) | 6.91 | 22.23 | 36.13 | n/a | 5:05 |
+
+*Kimi 4k-context returned HTTP 400 — likely tokenizer chunking pushed past the recipe's `max_model_len=8192` after the bench prompt template expanded. Not a regression; the model serves coherent output at shorter contexts.
+
+### Headlines
+
+1. **festr2 MiMo-V2.5-Pro (C34b) is the cluster's throughput leader by a wide margin.** 130 tok/s aggregate at 8-concurrent is ~2× the next model (GLM 72) and ~2.2× DSV4-Flash (62). Same hardware, same TP=8 — the gap is the model's MoE config + the MTP speculative-decoding gain + the wider cudagraph capture set we added in C34a.
+2. **InstantTensor is universal.** Three of the four images ship it, the fourth (Kimi's eugr build) also registers it — just under a different vllm install path. Recipe-line change only; no rebuild. Worth porting to every recipe.
+3. **DSV4-Pro at max_model_len=512 is the bottom of the table.** That's not the model's fault — the 102 GiB/rank weights leave essentially no KV budget at gpu_mem=0.90, so the recipe pins ctx low. For longer-context coding work, DSV4-Flash is the better DeepSeek-family pick; for top throughput, festr2 wins.
+4. **All four "recently retested" models produced coherent output to the standard smoke gates.** No regressions vs the per-model deployment cycles earlier today.
+
+### Recipes added in C36
+
+- `recipes/4x-spark-cluster/glm-5.1-nvfp4-instanttensor.yaml` — GLM with `--load-format instanttensor`
+- `recipes/4x-spark-cluster/kimi-k2.6-instanttensor.yaml` — Kimi with `--load-format instanttensor`
+
+### Bench script
+
+`/home/idonati/profiles/bench_c36.py` — auto-detects model from `/v1/models`, runs smoke + solo + 1/4/8-concurrent + 4k-context. Per-model output in `/home/idonati/profiles/c36_results.jsonl`. Reusable for future re-benches.

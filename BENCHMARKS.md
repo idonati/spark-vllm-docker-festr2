@@ -506,3 +506,42 @@ Same client (`/home/idonati/profiles/bench_c36.py`), same prompts, same protocol
 ### Bench script
 
 `/home/idonati/profiles/bench_c36.py` — auto-detects model from `/v1/models`, runs smoke + solo + 1/4/8-concurrent + 4k-context. Per-model output in `/home/idonati/profiles/c36_results.jsonl`. Reusable for future re-benches.
+
+## C37 — long-context decode grid across all models
+
+Per-model decode rate at 5 token-count points: ~1k, ~4k, ~8k, ~16k, ~26k. Targets `max_model_len`-permitting. DSV4-Pro skipped (max_model_len=512 too small to grid). Same client (`/home/idonati/profiles/bench_c37_longctx.py`), 80-token decode with `ignore_eos`, same hardware, same day.
+
+| ctx tokens | festr2 C34b | GLM-5.1 (IT) | DSV4-Flash | Kimi-K2.6 (IT) |
+|---|---|---|---|---|
+| ~1k | **30.7 tok/s** | 10.8 | 6.5 | 10.1 |
+| ~4k | **29.3** | 12.9 | 11.6 | 11.2 |
+| ~8k | **33.3** | 12.9 | 11.6 | (max_model_len 8k) |
+| ~16k | **27.0** | 12.7 | 11.5 | n/a |
+| ~26k | **24.9** | 12.0 | 10.9 | n/a |
+
+### Observations
+
+- **festr2 is the long-context winner by a wide margin.** Even at 26k context (its production target), decode stays at ~25 tok/s — 2× GLM, 2.3× DSV4-Flash. Plus MTP speculative decoding gives it a structural advantage. C34b's wider cudagraph capture set helps too.
+- **GLM-5.1 and DSV4-Flash are essentially equivalent on long-context decode** (12-13 tok/s flat). Pick based on model quality preference for your workload, not on long-context speed.
+- **DSV4-Flash prefill is the slow side**: 78.8s for a 26k-token prefill. That's 337 tok/s prefill rate. The decode is steady but anyone serving long-context chat with DSV4-Flash will feel the TTFT (~80s for a 26k cold start).
+- **Kimi caps at 8k** in this recipe (`max_model_len=8192`). At its supported range it's competitive with GLM. For long-context workloads on this cluster, festr2 is the clear pick.
+- **All four models hold their decode rate within 10-20% across the full context range** they support — no model "falls off a cliff" the way C28-era festr2 did (5.6 tok/s at 26k was the problem we solved in C34).
+
+### Prefill rate observations
+
+| ctx | festr2 | GLM | DSV4-Flash | Kimi |
+|---|---|---|---|---|
+| ~26k prefill | 6.1s = 4400 tok/s | 9.9s = 2680 tok/s | 78.8s = 337 tok/s | n/a |
+
+festr2 and GLM have well-tuned prefill paths. DSV4-Flash prefill is ~10× slower than festr2 prefill at the same context, which dominates user-perceived TTFT for long prompts.
+
+### Recommendation by workload
+
+- **Coding assistant with long context (>8k)**: festr2 MiMo-V2.5-Pro (C34b). 24-33 tok/s decode + fast prefill + MTP. The cluster's best general-purpose pick.
+- **Multi-step thinking-trace heavy tasks at moderate context (<8k)**: GLM-5.1 or Kimi-K2.6, both serve at 10-13 tok/s with reasoning-channel output. Pick on output style fit.
+- **Throughput-priority short-context serving**: festr2 wins again (130 tok/s aggregate at 8-conc per C36).
+- **Avoid for long-context interactive use**: DSV4-Flash (78s prefill at 26k makes TTFT painful even though decode is fine).
+
+### Bench script
+
+`/home/idonati/profiles/bench_c37_longctx.py` — auto-detects model, runs 5-point context grid via the OpenAI streaming API, separates prefill and decode timing. Output appended to `/home/idonati/profiles/c37_results.jsonl`.

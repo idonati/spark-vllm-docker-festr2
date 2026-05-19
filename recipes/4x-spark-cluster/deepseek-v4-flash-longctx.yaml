@@ -1,0 +1,72 @@
+# Recipe: DeepSeek-V4-Flash on 8× DGX Spark (sm_121, TP=8)
+# 284B-param model with 256 MoE experts, jasl's vLLM SM12x prototype.
+#
+# Production config: 11.4 tok/s sustained at TP=8 with RDMA RoCE multi-rail.
+# Requires the vllm-node-deepseek-v4 image (built from Dockerfile.deepseek-v4-sm120
+# which bakes in PR #40923 Marlin sm_12x cubin fix + jasl/vllm@ds4-sm120-prototype +
+# jasl/DeepGEMM@sm120 + native sm_120;sm_121 build instead of the broken 12.0+PTX path).
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-LongCtx
+description: "DSV4-Flash with max_model_len=128k (C39 long-session push)"
+
+# HuggingFace model
+model: deepseek-ai/DeepSeek-V4-Flash
+
+# Custom container with jasl's vLLM SM12x branch + #40923 baked in.
+# Build: bash build-and-copy.sh -f Dockerfile.deepseek-v4-sm120 -t vllm-node-deepseek-v4 ...
+container: vllm-node-deepseek-v4-nccl230
+
+# Build arg lets `bash run-recipe.sh ... --build` rebuild the image automatically.
+build_args:
+  - -f
+  - Dockerfile.deepseek-v4-sm120
+  - --gpu-arch
+  - "12.0;12.1"
+
+# Requires Ray distributed executor across 8 nodes; cannot run solo
+cluster_only: true
+
+# No runtime mods needed — patches baked into image
+mods: []
+
+# Default settings (CLI can override)
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.85
+  max_model_len: 131072
+  served_model_name: deepseek-v4-flash
+
+# V4-specific runtime env vars also set by Dockerfile ENV; restated here so
+# the recipe is self-documenting and overrideable.
+env:
+  VLLM_USE_DEEP_GEMM_E8M0: "0"
+  VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION: "1"
+  VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE: "256"
+  VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE: "128"
+  RAY_CGRAPH_get_timeout: "900"   # avoid Ray Compiled-DAG channel timeout (default 300s) under concurrent generative load
+
+# vLLM serve command. --load-format instanttensor uses NVIDIA's pipelined safetensors
+# loader (baked into image) — ~12× faster cold start (24s vs 290s) vs prefetch on EXT4.
+# Fallback if instanttensor regresses: swap for `--safetensors-load-strategy prefetch`.
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format instanttensor \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray \
+    --enforce-eager

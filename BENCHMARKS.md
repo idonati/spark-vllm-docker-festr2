@@ -578,3 +578,56 @@ For coding-team work at long context, **festr2 is the only model that holds a us
 ### Bench script
 
 `/home/idonati/profiles/bench_c38_longctx_conc.py` — 1/4/8-conc at parameter-able context length. Results in `/home/idonati/profiles/c38_results.jsonl`.
+
+## C39 — max single-session context per model (partial)
+
+Goal: trade concurrent slots for max_model_len, find each model's per-session context ceiling, update the production recipe.
+
+### festr2 C34c (128k) — confirmed
+
+New recipe `mimo-v2.5-pro-c34c-longctx.yaml`: same as C34b but `max_num_seqs=4` (down from 16), `max_model_len=131072` (up from 32k), cudagraph capture set narrowed to `[1,2,4,6,8,16]` to match the lower max_num_seqs.
+
+Solo decode at varying context (single session, ignore_eos=True, 60-token decode):
+
+| context (tokens) | prefill | decode |
+|---|---|---|
+| 51k | 16.65 s | 19.65 tok/s |
+| 92k | 36.05 s | 17.64 tok/s |
+| 122k | 34.05 s | 15.42 tok/s |
+
+festr2 holds 15+ tok/s decode at 122k tokens, near the 131k cap. Prefill scales linearly with context (~290 tok/s prefill rate). KV cache headroom at boot was 7.41 GiB / rank — same as C34b's 7.31 GiB, since vLLM allocates available cache memory not the configured-max-tokens budget.
+
+**Decision**: promote C34c as the long-session production recipe; keep C34b as the high-concurrency variant. Both ship.
+
+### DSV4-Flash @ 128k — does NOT work in practice
+
+Created `deepseek-v4-flash-longctx.yaml` with `max_model_len=131072`. Engine boots clean (78 GiB KV available, ~1.7M cluster-wide token budget), but **prefill at 16k+ tokens triggers Ray's compiled-DAG channel timeout** (`RAY_CGRAPH_get_timeout=900` is the recipe's setting):
+
+```
+ray.exceptions.RayChannelTimeoutError: System error: If the execution is expected
+to take a long time, increase RAY_CGRAPH_get_timeout which is currently 900 seconds.
+```
+
+Root cause: DSV4-Flash uses `--enforce-eager`, and at 16k+ tokens its prefill is slow enough (>15 min wall-clock at 16k based on C37 trends) that it exceeds even the 900s Ray channel timeout. The engine crashes hard (`EngineDeadError`); subsequent requests get HTTP 500.
+
+**Decision**: keep DSV4-Flash at `max_model_len=32768`. C37 already showed 78s prefill at 26k → still within the 900s Ray budget. Going higher requires either (a) dropping `--enforce-eager` to capture cudagraphs, or (b) raising `RAY_CGRAPH_get_timeout` to 3600+ — both untested. For now, 32k is the practical cap.
+
+`deepseek-v4-flash-longctx.yaml` is kept in-repo as a marker / future-rebench target, NOT as a production recipe.
+
+### Kimi @ 32k + GLM extended — blocked
+
+Created `kimi-k2.6-longctx.yaml` (32k, up from 8k) and would have created a GLM 100k+ variant.
+
+**AO5 SSH stopped responding** (`Connection timed out during banner exchange`) immediately after the DSV4-Flash engine crash — likely an OS-level side-effect of an OOM/crash on that node. Without AO5 the 8-node TP cluster can't boot. Requires power-cycle or BMC reset.
+
+**Per SOARES stop rule (b)**: hard infrastructure blocker requiring user intervention. C39 paused mid-flight with festr2's findings locked in and DSV4-Flash's ceiling documented. Kimi and GLM extended-ctx tests pending AO5 recovery.
+
+### Summary table (where C39 reached)
+
+| Model | Prior max_model_len | C39 verified | Production recipe |
+|---|---|---|---|
+| festr2 MiMo-V2.5-Pro | 32k (C34b) | **128k ✓** | `mimo-v2.5-pro-c34c-longctx.yaml` (NEW) |
+| DSV4-Flash | 32k | 32k (128k fails) | `deepseek-v4-flash.yaml` (unchanged) |
+| DSV4-Pro | 512 | 512 (memory-locked) | `deepseek-v4-pro.yaml` (unchanged) |
+| GLM-5.1 | 65k | (pending AO5) | `glm-5.1-nvfp4-instanttensor.yaml` (C36 default for now) |
+| Kimi-K2.6 | 8k | (pending AO5) | `kimi-k2.6-instanttensor.yaml` (C36 default for now) |

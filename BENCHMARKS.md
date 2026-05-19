@@ -345,3 +345,74 @@ The new priority order after C34a:
 1. **Cutlass-dsl 4.5.1 native NVFP4 MoE** (task #60) — still attacks the intercept (now 31.9 ms in C34a, 29.5 in C34). With native NVFP4 the per-step intercept could drop meaningfully, lifting per-request decode rate across all batch sizes. See `design/c35-cutlass451-plan.md`.
 2. **Try `max_num_seqs=24-32`** with a long-context grid — current sweep covers up to 8 at 26k; whether 12-conc-at-26k still scales linearly is an open question.
 3. **C33 (TQ-K8V4)** — definitively deferred. Even at 64k+ contexts, the upside is now bounded against a *much* higher baseline (e.g., 125 tok/s aggregate at 8-conc 26k).
+
+## C35 — cutlass-dsl 4.5.1 native NVFP4 MoE (correctness pass, perf regression)
+
+C34a + a new image (`vllm-node-mimo-pr41797-nccl230-tfgit-cutlass451-sm12x`) bumping `nvidia-cutlass-dsl` 4.5.0 → 4.5.1 and switching `--moe-backend marlin` → `cutlass`. Both `VLLM_USE_FLASHINFER_MOE_FP4=0` and `NCCL_NVLS_ENABLE=0` dropped from env (those were the Marlin-routing workaround).
+
+### Headline: correctness fixed, perf worse
+
+**Two results, both publishable.**
+
+1. **Cutlass-dsl 4.5.1 fixes the NVFP4 MoE correctness bug on sm_121a** (the original `NVIDIA/cutlass#3227` story). Smoke test produces coherent output (`"Hello!"`, `"12 × 7 = 84"`), no garbage. This is the first sm_121a confirmation in addition to hassan-abdallah's existing sm_120a confirmation — the bug-fix covers both ArchTags.
+
+2. **Native NVFP4 MoE is consistently 7-25% slower than the Marlin FP4→FP8 dequant workaround on sm_121a, gap widens with batch size.**
+
+### Comparison vs C34a (same recipe except `--moe-backend cutlass`)
+
+#### Solo + linear fit
+
+| ctx | C34a tok/s | C35 tok/s | Δ |
+|---|---|---|---|
+| 531 | 31.4 | 30.0 | -4% |
+| 4373 | 33.0 | 29.6 | -10% |
+| 8441 | 27.3 | 28.7 | +5% |
+| 16690 | 29.1 | 26.5 | -9% |
+| 22905 | 28.8 | 25.7 | -11% |
+| 26973 | 27.4 | 25.1 | -8% |
+
+C34a fit: `29.5 + 0.265 × (ctx/1k)` (original C34) → `31.9 + 0.161 × (ctx/1k)` (C34a)
+C35 fit: `33.0 + 0.261 × (ctx/1k)` — intercept slightly worse (+3% vs C34a), slope worse (+62% vs C34a's tighter 0.161 — though C34a's slope is best in class because of its wider cudagraph capture)
+
+#### Concurrent decode at short context
+
+| concurrent | C34a agg | C35 agg | Δ |
+|---|---|---|---|
+| 1 | 29.9 | 27.6 | -8% |
+| 4 | 83.8 | 69.6 | -17% |
+| 8 | **157.0** | 131.2 | -16% |
+| 12 | 171.4 | 155.7 | -9% |
+| 16 | **201.0** | 150.0 | **-25%** |
+
+#### Concurrent decode at 26k
+
+| concurrent | C34a agg | C35 agg | Δ |
+|---|---|---|---|
+| 1 | 24.6 | 22.9 | -7% |
+| 4 | 64.9 | 59.5 | -8% |
+| 8 | 124.9 | 112.7 | -10% |
+
+### Why is native NVFP4 slower than Marlin's dequant?
+
+The gap *widens* with batch size at short context (-8% at 1-conc, -25% at 16-conc). Speculation:
+
+- **Marlin's FP4→FP8 dequant is amortized across the batch**: one dequant pass per expert load, then a tuned FP8 GEMM with high tensor-core utilization. The dequant cost gets divided across batch elements.
+- **Cutlass-dsl 4.5.1's NVFP4 GEMM on sm_121a may not be using the FP4 tensor cores effectively**, or may be using them at a less-favorable shape for the small-batch MoE expert call sizes we hit at TP=8 (per-expert tile shapes can be small).
+- **MoE expert routing overhead** may scale differently between the two paths — the dispatch + scatter/gather pattern around the per-expert GEMM is path-specific.
+
+This isn't a closed question — it's a tuning gap that may close in a future cutlass-dsl release. But for now, on sm_121a as of 2026-05-19 with vLLM `v0.1.dev1+g0891716c2.d20260509`, the Marlin workaround is the production-faster path.
+
+### Decision
+
+**Keep Marlin in production.** C34a is the production recipe. C35 is reverted (image kept for future re-test when cutlass-dsl ships a more tuned sm_121 kernel).
+
+The `VLLM_USE_FLASHINFER_MOE_FP4=0` + `NCCL_NVLS_ENABLE=0` env vars stay in the [SM121 NVFP4 Marlin workaround] story — they're not a bug fix, they're how we get the *faster* path on this hardware.
+
+### Public reporting
+
+- **`NVIDIA/cutlass#3227`**: post sm_121a correctness confirmation + note that 4.5.1 fixes the original `_mma` ptxas garbage-output bug on sm_121a as well as the previously-confirmed sm_120a (per hassan-abdallah). Include perf observation that native is slower than Marlin currently — useful signal for the cutlass team's sm_12x tuning priorities.
+- **`vllm-project/vllm#41519`**: short follow-up confirming that with the fork's full setup the MiMo-V2.5-Pro is now serving stably at 125-201 tok/s aggregate concurrent throughput on sm_121a (C34a numbers); the Marlin workaround stays for now.
+
+### Recipe
+
+`recipes/4x-spark-cluster/mimo-v2.5-pro-c35-cutlass.yaml` — kept in-repo for reproducibility, but not the production recipe.

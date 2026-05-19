@@ -1,0 +1,57 @@
+# Cycle 35: native cutlass-dsl 4.5.1 NVFP4 MoE on sm_121a.
+# Builds on C34a (max_num_seqs=16, widened cudagraph capture) but
+# switches --moe-backend marlin -> cutlass and drops the two env vars
+# (VLLM_USE_FLASHINFER_MOE_FP4=0, NCCL_NVLS_ENABLE=0) that previously
+# routed around Marlin.
+#
+# Smoke gate: model must produce coherent output to "Say hello".
+# Garbage output signatures (e.g. !!!!!!, あるい, ייך) mean 4.5.1
+# still hits the sm_121a ptxas bug NVIDIA/cutlass#3227.
+
+recipe_version: "1"
+name: MiMo-V2.5-Pro-C35-Cutlass451
+description: "C34a + native cutlass-dsl 4.5.1 NVFP4 MoE (replaces Marlin dequant)"
+
+model: festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8
+container: vllm-node-mimo-pr41797-nccl230-tfgit-cutlass451-sm12x
+
+cluster_only: true
+mods: []
+
+defaults:
+  port: 5001
+  host: 0.0.0.0
+  tensor_parallel: 8
+  gpu_memory_utilization: 0.72
+  max_model_len: 32768
+  max_num_batched_tokens: 16384
+  max_num_seqs: 16
+  served_model_name: mimo-v2.5-pro
+
+env:
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "1"
+  RAY_CGRAPH_get_timeout: "1800"
+  NCCL_DEBUG: "WARN"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+command: |
+  vllm serve festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    -tp {tensor_parallel} \
+    --pipeline-parallel-size 1 \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format safetensors \
+    --attention-backend triton_attn_diffkv \
+    --moe-backend cutlass \
+    --speculative-config '{{"model": "festr2/MiMo-V2.5-Pro-NVFP4-MXFP8-attn-TP8", "method": "mtp", "num_speculative_tokens": 1}}' \
+    --compilation-config '{{"max_cudagraph_capture_size": 32, "cudagraph_capture_sizes": [1,2,4,6,8,12,16,24,32]}}' \
+    --reasoning-parser qwen3 \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --distributed-executor-backend ray

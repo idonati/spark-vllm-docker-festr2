@@ -1,0 +1,14 @@
+# Bump cutlass-dsl 4.5.0 -> 4.5.1 to test native NVFP4 MoE on sm_121a.
+# Background: 4.5.0 had a _mma ptxas lowering bug on sm_120/120f/121a
+# (NVIDIA/cutlass#3227) that produces garbage NVFP4 MoE output, which
+# is why we currently route NVFP4 MoE through Marlin (dequant FP4->FP8).
+# 4.5.1 reportedly fixes the bug on sm_120a per hassan-abdallah; this
+# image lets us test on sm_121a (different ArchTag) and quantify the
+# perf win vs Marlin.
+
+FROM vllm-node-mimo-pr41797-nccl230-tfgit-sm12x:latest
+
+RUN pip install --upgrade --no-deps \
+        nvidia-cutlass-dsl==4.5.1 \
+        nvidia-cutlass-dsl-libs-base==4.5.1 \
+ && python3 -c "import importlib.metadata as m; print(\"cutlass-dsl:\", m.version(\"nvidia-cutlass-dsl\"))"

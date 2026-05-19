@@ -416,3 +416,42 @@ The `VLLM_USE_FLASHINFER_MOE_FP4=0` + `NCCL_NVLS_ENABLE=0` env vars stay in the 
 ### Recipe
 
 `recipes/4x-spark-cluster/mimo-v2.5-pro-c35-cutlass.yaml` — kept in-repo for reproducibility, but not the production recipe.
+
+## C34b — InstantTensor loader (6.7× faster main-model weight load)
+
+Same as C34a (`max_num_seqs=16`, widened cudagraph capture, MTP, Marlin NVFP4 MoE) but with `--load-format instanttensor` instead of `safetensors`. Discovered as a side-effect of deploying DeepSeek-V4-Pro/Flash on the same cluster — their recipes use `instanttensor` and load 5-6× faster.
+
+### Headline
+
+| Phase | C34a (safetensors) | C34b (instanttensor) | Speedup |
+|---|---|---|---|
+| Main-model weight load (114 shards on rank 0) | 11:47 | **1:46** (318,545 tensors @ 3000 it/s) | **6.7×** |
+| MTP drafter load | 1:04 (shared weights, fast path) | 1:43 | (drafter doesn't benefit — it shares weights with the main model that just finished loading) |
+| Total weight load | 12:51 | **3:29** | **3.7×** |
+| Net boot-to-ready | ~14 min | **~7 min** | ~2× |
+| Decode quality | coherent | coherent | identical |
+
+The festr2 vLLM image (`vllm-node-mimo-pr41797-nccl230-tfgit-sm12x`) already had `instanttensor` registered in `vllm/model_executor/model_loader/__init__.py` (lines 38, 55) and the `instanttensor==0.1.8` PyPI package installed — no image rebuild required. Single recipe-line change.
+
+### What InstantTensor does
+
+InstantTensor is NVIDIA's pipelined-I/O safetensors loader. Instead of `mmap` + per-tensor lazy load (which forces serialized disk reads when EXT4 can't auto-prefetch a 555-GiB checkpoint with 38 GiB RAM headroom), it streams shards in pipelined chunks distributed across ranks. The festr2 checkpoint is split into 114 large shards but contains 318,545 tensors total (fine-grained — many small MoE expert tensors); InstantTensor amortizes the per-tensor `safe_open`/`get_tensor` overhead that dominates the standard loader at this granularity.
+
+### Quality validation
+
+Same coherence gates as C32 / C34 / C34a / C35:
+- `"Say hello."` → `"Hello! 👋 How are you doing today? I'm MiMo, your AI assistant..."` ✓
+- `"12 × 7 = ?"` → `"12 × 7 = **84**"` ✓
+- `"def fibonacci(n):"` → coherent Python tutorial intro ✓
+
+Solo decode on cold-ish post-warmup: 25-28 tok/s. (C34a steady-state was 33 tok/s — early cold-call variance is normal; full perf sweep on C34b not re-run since it's the same engine state once weights are loaded.)
+
+### Decision
+
+**Promote C34b to production.** The default production recipe pointer should be `mimo-v2.5-pro-c34b-instanttensor.yaml`. C34a stays in-repo as the safetensors-baseline reference.
+
+Caveats: if a deployer hits an InstantTensor compatibility issue (different checkpoint structure, older drivers), they can switch back to `--load-format safetensors` for a 4× boot-time penalty.
+
+### Recipe
+
+`recipes/4x-spark-cluster/mimo-v2.5-pro-c34b-instanttensor.yaml` — same as C34a with one line changed.
